@@ -23,6 +23,7 @@ use strom_types::{
 };
 use tracing::{debug, error, info, trace, warn};
 
+use crate::gst::PipelineError;
 use crate::layout;
 use crate::state::AppState;
 
@@ -558,6 +559,7 @@ pub async fn delete_flow(
     ),
     responses(
         (status = 200, description = "Flow started", body = FlowResponse),
+        (status = 400, description = "Flow definition rejected", body = ErrorResponse),
         (status = 404, description = "Flow not found", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     )
@@ -568,8 +570,16 @@ pub async fn start_flow(
 ) -> Result<Json<FlowResponse>, (StatusCode, Json<ErrorResponse>)> {
     // Start the pipeline
     if let Err(e) = state.start_flow(&id).await {
+        // A property the flow definition got wrong is the client's mistake, not
+        // the server's: the same errors are a 400 on the live update path.
+        let status = match e {
+            PipelineError::InvalidProperty { .. } | PipelineError::PropertyNotMutable { .. } => {
+                StatusCode::BAD_REQUEST
+            }
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        };
         return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
+            status,
             Json(ErrorResponse::with_details(
                 "Failed to start flow",
                 e.to_string(),
