@@ -806,6 +806,7 @@ mod tests {
             max_sessions,
             slot_audio_appsrcs: Vec::new(),
             slot_video_appsrcs: Vec::new(),
+            slot_decodebins: Vec::new(),
             slot_assignments: Arc::new(RwLock::new(vec![None; max_sessions])),
         }
     }
