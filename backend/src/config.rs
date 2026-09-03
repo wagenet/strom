@@ -535,7 +535,8 @@ log_level = "   "
         let original_dir = std::env::current_dir().unwrap();
         std::env::set_current_dir(&temp_dir).unwrap();
 
-        let config = Config::from_figment(None, None, None, None, None, None, None, None).unwrap();
+        let config =
+            Config::from_figment(None, None, None, None, None, None, None, None, None).unwrap();
 
         let _ = std::env::set_current_dir(original_dir);
 
@@ -570,6 +571,7 @@ log_level = "   "
         std::env::remove_var("STROM_STORAGE_DATABASE_URL");
 
         let config = Config::from_figment(
+            None,
             None,
             None,
             None,
