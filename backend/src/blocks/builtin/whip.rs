@@ -18,6 +18,7 @@ use crate::blocks::{
 use crate::gst::ice_preflight;
 use crate::gst::keyframe_request;
 use crate::gst::rtp_hdrext;
+use crate::gst::whip_bridge::{self, SessionBridge};
 use crate::whip_session_manager::{
     Medium, SessionActivity, SessionCleanupRequest, SlotOutput, StallSide, WhipEndpointConfig,
     WhipSlotLiveness, DECODE_GRACE,
@@ -28,7 +29,7 @@ use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
 use std::collections::HashMap;
 use std::net::TcpListener;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use strom_types::block::StreamMode;
@@ -973,11 +974,9 @@ pub fn create_whipserversrc_for_session(
     let slot_audio_appsrc: Option<gst_app::AppSrc> = config.slot_audio_appsrcs.get(slot).cloned();
     let slot_video_appsrc: Option<gst_app::AppSrc> = config.slot_video_appsrcs.get(slot).cloned();
 
-    // Shared timestamp offset for A/V sync across audio and video appsrcs.
-    // Computed from the first buffer on either stream:
-    //   offset = main_pipeline_running_time - buffer_pts
-    // i64::MIN means "not yet computed".
-    let shared_ts_offset = Arc::new(AtomicI64::new(i64::MIN));
+    // Shared appsink -> appsrc bridge state for this session: the A/V timestamp
+    // offset both streams rebase onto, and the unstamped-buffer drop count.
+    let session_bridge = Arc::new(SessionBridge::new());
 
     // Liveness for this session, in the shape the session manager reads it: it
     // has to tell a slot that still has a publisher producing media behind it
@@ -1198,7 +1197,7 @@ pub fn create_whipserversrc_for_session(
                     }
                 }
 
-                let ts_offset = shared_ts_offset.clone();
+                let bridge = session_bridge.clone();
                 let main_pipeline_for_ts = main_pipeline_weak.clone();
                 let media_for_log = media_type.to_string();
                 let activity_cb = activity_for_pads.clone();
@@ -1219,7 +1218,7 @@ pub fn create_whipserversrc_for_session(
                                 &sample,
                                 &appsrc,
                                 &session_finished,
-                                &ts_offset,
+                                &bridge,
                                 &main_pipeline_for_ts,
                                 &media_for_log,
                                 slot,
@@ -1279,8 +1278,9 @@ pub fn create_whipserversrc_for_session(
 /// Bridge one sample from a session's appsink into its slot's appsrc, shifting
 /// its PTS by the offset shared across the session's audio and video.
 ///
-/// The offset is computed once, from the first buffer on either stream, then
-/// applied to every buffer on both streams to preserve A/V sync.
+/// The offset is computed once, from the first stamped buffer on either stream,
+/// then applied to every buffer on both streams to preserve A/V sync. A buffer
+/// with no PTS is dropped: see [`whip_bridge`].
 ///
 /// Nothing is pushed once `session_finished` is set. The slot's appsrc belongs to
 /// whoever holds the slot, and takeover releases the slot while the displaced
@@ -1290,7 +1290,7 @@ fn forward_sample_to_slot(
     sample: &gst::Sample,
     appsrc: &gst_app::AppSrc,
     session_finished: &AtomicBool,
-    ts_offset: &AtomicI64,
+    bridge: &SessionBridge,
     main_pipeline: &gst::glib::WeakRef<gst::Pipeline>,
     media: &str,
     slot: usize,
@@ -1299,56 +1299,33 @@ fn forward_sample_to_slot(
         return Ok(());
     }
 
-    let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
-    let pts = buffer.pts();
+    let outcome = bridge
+        .forward(sample, appsrc, || {
+            let main_pipeline = main_pipeline.upgrade()?;
+            let clock = main_pipeline.clock()?;
+            let base_time = main_pipeline.base_time()?;
+            Some(clock.time().saturating_sub(base_time))
+        })
+        .ok_or(gst::FlowError::Error)?;
 
-    // Compute offset on the first buffer from either stream
-    let offset_ns = {
-        let current = ts_offset.load(Ordering::Relaxed);
-        if current != i64::MIN {
-            current
-        } else if let (Some(pts_val), Some(main_pipeline)) = (pts, main_pipeline.upgrade()) {
-            let clock = main_pipeline.clock();
-            let base_time = main_pipeline.base_time();
-            if let (Some(clock), Some(base_time)) = (clock, base_time) {
-                let now = clock.time();
-                let running = now.saturating_sub(base_time);
-                let offset = running.nseconds() as i64 - pts_val.nseconds() as i64;
-                ts_offset.store(offset, Ordering::Relaxed);
-                info!(
-                    "WHIP Input: Computed shared ts-offset={}ms from {} stream (slot {})",
-                    offset / 1_000_000,
-                    media,
-                    slot
+    match outcome {
+        whip_bridge::Forwarded::OffsetComputed(offset) => {
+            info!(
+                "WHIP Input: Computed shared ts-offset={}ms from {} stream (slot {})",
+                offset / 1_000_000,
+                media,
+                slot
+            );
+        }
+        whip_bridge::Forwarded::DroppedUnstamped { dropped } => {
+            if whip_bridge::should_log_drop(dropped) {
+                warn!(
+                    "WHIP Input: dropped {} buffer(s) with no PTS on the {} stream (slot {}); forwarding one fails the downstream muxer and takes the whole flow with it",
+                    dropped, media, slot
                 );
-                offset
-            } else {
-                0
             }
-        } else {
-            0
         }
-    };
-
-    // Apply offset to buffer PTS
-    if offset_ns != 0 {
-        if let Some(pts_val) = pts {
-            let adjusted = (pts_val.nseconds() as i64 + offset_ns).max(0) as u64;
-            let mut new_buffer = buffer.copy();
-            {
-                let buf_ref = new_buffer.get_mut().unwrap();
-                buf_ref.set_pts(gst::ClockTime::from_nseconds(adjusted));
-            }
-            let new_sample = gst::Sample::builder()
-                .buffer(&new_buffer)
-                .caps(&sample.caps().unwrap().to_owned())
-                .build();
-            let _ = appsrc.push_sample(&new_sample);
-        } else {
-            let _ = appsrc.push_sample(sample);
-        }
-    } else {
-        let _ = appsrc.push_sample(sample);
+        whip_bridge::Forwarded::Restamped | whip_bridge::Forwarded::Unadjusted => {}
     }
 
     Ok(())
@@ -2959,8 +2936,8 @@ mod tests {
                 .set_pts(gst::ClockTime::from_seconds(seconds));
             gst::Sample::builder().buffer(&buffer).caps(&caps).build()
         };
-        // Offsets already computed, so no main pipeline is needed.
-        let ts_offset = AtomicI64::new(0);
+        // No main pipeline, so the bridge forwards without restamping.
+        let bridge = SessionBridge::new();
         let no_main_pipeline = gst::glib::WeakRef::new();
 
         let displaced = AtomicBool::new(true);
@@ -2968,7 +2945,7 @@ mod tests {
             &sample_at(1),
             &appsrc,
             &displaced,
-            &ts_offset,
+            &bridge,
             &no_main_pipeline,
             "audio",
             0,
@@ -2980,7 +2957,7 @@ mod tests {
             &sample_at(2),
             &appsrc,
             &current,
-            &ts_offset,
+            &bridge,
             &no_main_pipeline,
             "audio",
             0,
