@@ -1,19 +1,15 @@
 //! Guards for the App Nap opt-out in `macos_app_nap`.
 //!
-//! About thirty seconds after launch macOS moves a windowless Cocoa process into
-//! the background QoS band, and every thread drops to scheduling priority 4 — on
-//! Apple Silicon, efficiency cores at a throttled clock, which costs a 1080p x264
-//! flow 5-7x its wall clock. Headless Strom is that shape, because
-//! `gst_macos_main` takes the main thread for a CFRunLoop and we never open a
-//! window. The server holds an `NSProcessInfo` activity assertion to opt out.
+//! ~32 s after launch macOS moves headless Strom into the background QoS band and
+//! every thread drops to scheduling priority 4 — on Apple Silicon, efficiency
+//! cores at a throttled clock, which costs a 1080p x264 flow ~7x its wall clock.
+//! The server holds an `NSProcessInfo` activity assertion to opt out.
 //!
 //! Two failure modes, tested separately because they cost three orders of
-//! magnitude apart:
-//!
-//! * the call goes missing from `run_headless_entry` — the realistic regression,
-//!   caught in ~2 s by watching for the line it logs;
-//! * macOS stops honouring the assertion — only observable by waiting out the
-//!   demotion window, so that one is opt-in and run by hand.
+//! magnitude apart: the call going missing from `run_headless_entry` (the
+//! realistic regression, caught in well under a second), and macOS ceasing to
+//! honour the assertion (only observable by waiting out the demotion window, so
+//! opt-in and run by hand).
 #![cfg(target_os = "macos")]
 
 use std::io::Read;
@@ -139,17 +135,16 @@ fn max_thread_priority(pid: u32) -> Option<u32> {
 
 /// The behavioural check: does macOS still honour the assertion?
 ///
-/// Opt-in, because the demotion lands at ~30 s and there is no way to observe it
-/// without waiting past that. Run it by hand on a real Mac after touching this
-/// module, or after a macOS or `objc2-foundation` upgrade:
+/// Opt-in, because the demotion lands at ~32 s and cannot be observed without
+/// waiting past it. Run by hand on a real Mac after touching this module or
+/// upgrading macOS or `objc2-foundation`:
 ///
 /// ```text
 /// STROM_TEST_APP_NAP=1 cargo test --test macos_app_nap_test -- --ignored
 /// ```
 ///
-/// Deliberately not wired into CI: the GitHub macOS runner is a headless VM and
-/// it is unverified whether it App-Naps at all, so there it would most likely
-/// spend a minute proving nothing.
+/// Not wired into CI: the GitHub macOS runner is a headless VM and it is
+/// unverified whether it App-Naps at all.
 #[test]
 #[ignore = "waits ~50 s for the App Nap window; set STROM_TEST_APP_NAP=1"]
 fn server_is_not_demoted_to_background_qos() {

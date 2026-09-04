@@ -643,9 +643,9 @@ fn run_headless_entry(
     log_reload_handle: strom::state::LogReloadHandle,
     default_log_filter: String,
 ) -> anyhow::Result<()> {
-    // Before the CFRunLoop starts: a windowless Cocoa process is App-Napped into
-    // the background QoS band about thirty seconds in, and every pipeline after
-    // that runs on efficiency cores.
+    // Before the CFRunLoop starts: without this the process is App-Napped into the
+    // background QoS band ~32 s in, and every pipeline after that runs on
+    // efficiency cores.
     strom::macos_app_nap::hold_activity_for_process_lifetime();
 
     #[cfg(target_os = "macos")]

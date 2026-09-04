@@ -146,7 +146,7 @@ uuid = { version = "1.23", features = ["v4"] }
 # transitive dependency of gstreamer-video, so naming it adds nothing to build.
 gstreamer-base.workspace = true
 # App Nap opt-out: see backend/src/macos_app_nap.rs. Already in the tree via
-# winit/eframe, so this adds no new crate to the build.
+# eframe, so this adds no new crate.
 objc2-foundation = { version = "0.3", default-features = false, features = [
     "std",
     "NSProcessInfo",
