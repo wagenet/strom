@@ -17,6 +17,7 @@ use crate::blocks::{
 use crate::gst::ice_preflight;
 use crate::gst::keyframe_request;
 use crate::gst::rtp_hdrext;
+use crate::gst::whip_bridge::{self, SessionBridge};
 use crate::whip_session_manager::{
     ActivityStamp, SessionActivity, SessionCleanupRequest, WhipEndpointConfig,
 };
@@ -26,7 +27,7 @@ use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
 use std::collections::HashMap;
 use std::net::TcpListener;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use strom_types::block::StreamMode;
@@ -965,11 +966,9 @@ pub fn create_whipserversrc_for_session(
         flag.store(false, Ordering::Relaxed);
     }
 
-    // Shared timestamp offset for A/V sync across audio and video appsrcs.
-    // Computed from the first buffer on either stream:
-    //   offset = main_pipeline_running_time - buffer_pts
-    // i64::MIN means "not yet computed".
-    let shared_ts_offset = Arc::new(AtomicI64::new(i64::MIN));
+    // Shared appsink -> appsrc bridge state for this session: the A/V timestamp
+    // offset both streams rebase onto, and the unstamped-buffer drop count.
+    let session_bridge = Arc::new(SessionBridge::new());
 
     // Liveness for this session, in the shape the session manager reads it: it
     // has to tell a slot that still has a publisher producing media behind it
@@ -1180,7 +1179,7 @@ pub fn create_whipserversrc_for_session(
                     }
                 }
 
-                let ts_offset = shared_ts_offset.clone();
+                let bridge = session_bridge.clone();
                 let main_pipeline_for_ts = main_pipeline_weak.clone();
                 let media_for_log = media_type.to_string();
                 let activity_cb = activity_for_pads.clone();
@@ -1194,58 +1193,35 @@ pub fn create_whipserversrc_for_session(
                             activity_cb.touch_ingress();
 
                             let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
-                            let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
-                            let pts = buffer.pts();
 
-                            // Compute offset on the first buffer from either stream
-                            let offset_ns = {
-                                let current = ts_offset.load(Ordering::Relaxed);
-                                if current != i64::MIN {
-                                    current
-                                } else if let (Some(pts_val), Some(main_pipeline)) =
-                                    (pts, main_pipeline_for_ts.upgrade())
-                                {
-                                    let clock = main_pipeline.clock();
-                                    let base_time = main_pipeline.base_time();
-                                    if let (Some(clock), Some(base_time)) = (clock, base_time) {
-                                        let now = clock.time();
-                                        let running = now.saturating_sub(base_time);
-                                        let offset = running.nseconds() as i64 - pts_val.nseconds() as i64;
-                                        ts_offset.store(offset, Ordering::Relaxed);
-                                        info!(
-                                            "WHIP Input: Computed shared ts-offset={}ms from {} stream (slot {})",
-                                            offset / 1_000_000,
-                                            media_for_log,
-                                            slot
+                            let outcome = bridge
+                                .forward(&sample, &appsrc, || {
+                                    let main_pipeline = main_pipeline_for_ts.upgrade()?;
+                                    let clock = main_pipeline.clock()?;
+                                    let base_time = main_pipeline.base_time()?;
+                                    Some(clock.time().saturating_sub(base_time))
+                                })
+                                .ok_or(gst::FlowError::Error)?;
+
+                            match outcome {
+                                whip_bridge::Forwarded::OffsetComputed(offset) => {
+                                    info!(
+                                        "WHIP Input: Computed shared ts-offset={}ms from {} stream (slot {})",
+                                        offset / 1_000_000,
+                                        media_for_log,
+                                        slot
+                                    );
+                                }
+                                whip_bridge::Forwarded::DroppedUnstamped { dropped } => {
+                                    if whip_bridge::should_log_drop(dropped) {
+                                        warn!(
+                                            "WHIP Input: dropped {} buffer(s) with no PTS on the {} stream (slot {}); forwarding one fails the downstream muxer and takes the whole flow with it",
+                                            dropped, media_for_log, slot
                                         );
-                                        offset
-                                    } else {
-                                        0
                                     }
-                                } else {
-                                    0
                                 }
-                            };
-
-                            // Apply offset to buffer PTS
-                            if offset_ns != 0 {
-                                if let Some(pts_val) = pts {
-                                    let adjusted = (pts_val.nseconds() as i64 + offset_ns).max(0) as u64;
-                                    let mut new_buffer = buffer.copy();
-                                    {
-                                        let buf_ref = new_buffer.get_mut().unwrap();
-                                        buf_ref.set_pts(gst::ClockTime::from_nseconds(adjusted));
-                                    }
-                                    let new_sample = gst::Sample::builder()
-                                        .buffer(&new_buffer)
-                                        .caps(&sample.caps().unwrap().to_owned())
-                                        .build();
-                                    let _ = appsrc.push_sample(&new_sample);
-                                } else {
-                                    let _ = appsrc.push_sample(&sample);
-                                }
-                            } else {
-                                let _ = appsrc.push_sample(&sample);
+                                whip_bridge::Forwarded::Restamped
+                                | whip_bridge::Forwarded::Unadjusted => {}
                             }
 
                             Ok(gst::FlowSuccess::Ok)

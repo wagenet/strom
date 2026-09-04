@@ -23,6 +23,7 @@ pub mod video_frame;
 pub mod vimage;
 pub mod volume_ramp;
 pub mod whep_probe;
+pub mod whip_bridge;
 
 pub use discovery::ElementDiscovery;
 pub use pipeline::{PipelineError, PipelineManager};
