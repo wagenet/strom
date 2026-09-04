@@ -765,18 +765,16 @@ pub async fn start_flow(
     if let Err(e) = state.start_flow(&id).await {
         // A property the flow definition got wrong is the client's mistake, not
         // the server's: the same errors are a 400 on the live update path.
-        let status = match e {
+        let (status, message) = match e {
+            PipelineError::FlowNotFound(_) => (StatusCode::NOT_FOUND, "Flow not found"),
             PipelineError::InvalidProperty { .. } | PipelineError::PropertyNotMutable { .. } => {
-                StatusCode::BAD_REQUEST
+                (StatusCode::BAD_REQUEST, "Failed to start flow")
             }
-            _ => StatusCode::INTERNAL_SERVER_ERROR,
+            _ => (StatusCode::INTERNAL_SERVER_ERROR, "Failed to start flow"),
         };
         return Err((
             status,
-            Json(ErrorResponse::with_details(
-                "Failed to start flow",
-                e.to_string(),
-            )),
+            Json(ErrorResponse::with_details(message, e.to_string())),
         ));
     }
 

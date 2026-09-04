@@ -1,14 +1,12 @@
 //! Regression test: a property value of the wrong type in a flow definition
 //! must fail the build, not panic the task that is serving the request.
 //!
-//! `POST /api/flows` lets a client name both a property and its value, and
-//! `properties.rs` used to hand whatever arrived straight to
-//! `element.set_property()` whenever it did not recognise the property's type
-//! ("try i64, might work"). GLib reports every kind of misuse by panicking, so
-//! `{"element_type": "videotestsrc", "properties": {"pattern": 1}}` unwound
-//! the task at `POST /api/flows/{id}/start`: the client got a dropped
-//! connection instead of a response, and `start_flow`'s error path — which
-//! tears the half-built flow down — never ran.
+//! `POST /api/flows` lets a client name both a property and its value, and GLib
+//! reports every kind of misuse by panicking. Handing one to
+//! `element.set_property()` without checking it against the spec unwinds the
+//! task at `POST /api/flows/{id}/start`: the client gets a dropped connection
+//! instead of a response, and `start_flow`'s error path — which tears the
+//! half-built flow down — never runs.
 //!
 //! Each case here panics if the checked conversion is reverted, which fails
 //! the test.
@@ -37,7 +35,7 @@ fn plugins_available() -> bool {
         return true;
     }
     assert!(
-        std::env::var("STROM_REQUIRE_GST_PLUGINS").is_err(),
+        strom_types::env::var_opt("STROM_REQUIRE_GST_PLUGINS").is_none(),
         "STROM_REQUIRE_GST_PLUGINS is set but these elements are missing: {}",
         missing.join(", ")
     );
@@ -174,8 +172,8 @@ async fn integer_below_the_declared_minimum_is_rejected() {
     assert!(reason.contains("-1"), "message omits the range: {reason}");
 }
 
-/// A property the element does not have used to be set blindly ("property not
-/// found, try anyway").
+/// A property the element does not have must fail before it reaches GLib, which
+/// panics on it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unknown_property_is_rejected() {
     if !plugins_available() {

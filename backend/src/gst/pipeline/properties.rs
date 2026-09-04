@@ -805,8 +805,8 @@ const MAX_LISTED_ENUM_VALUES: usize = 24;
 /// coerce, and a value `g_param_value_validate` has to clamp all abort the
 /// calling thread. `POST /api/flows` lets a client pick the property name and
 /// the value, so an unchecked `set_property` turns a request body into a panic
-/// — `{"pattern": 1}` on a `videotestsrc` used to unwind the task serving the
-/// request, taking the flow's teardown with it. Nothing reaches GLib from here
+/// — `{"pattern": 1}` on a `videotestsrc` is enough, and the unwind crosses the
+/// axum handler and skips the flow's teardown. Nothing reaches GLib from here
 /// without having been checked against the spec first.
 fn checked_property_value(
     pspec: &glib::ParamSpec,
@@ -832,16 +832,13 @@ fn checked_property_value(
         if target == gst::Structure::static_type() && v == "NULL" {
             return Ok(None::<gst::Structure>.to_value());
         }
-        return glib::Value::deserialize_with_pspec(v, pspec)
-            .map_err(|_| format!("Cannot parse \"{}\" as {}", v, target_name));
+        return deserialized_value(pspec, v, target_name);
     }
 
     if let PropertyValue::Bool(v) = prop_value {
-        return if target == glib::Type::BOOL {
-            Ok(v.to_value())
-        } else {
-            Err(format!("Property expects {}, got a boolean", target_name))
-        };
+        if target == glib::Type::BOOL {
+            return Ok(v.to_value());
+        }
     }
 
     // GLib enums are integers underneath, so an integer that names a real
@@ -865,25 +862,13 @@ fn checked_property_value(
             });
     }
 
-    // Flags are a bitmask of integers, so the same applies bit by bit. The
-    // deserializer takes the whole mask at once but does not check it against
-    // the class, so check it here and let the deserializer do the assembling.
+    // Flags are a bitmask of integers, so the deserializer assembles the whole
+    // mask at once; `check_against_spec` is what tests it against the class.
     if target.is_a(glib::Type::FLAGS) {
         let n = integer_operand(prop_value, target_name)?;
-        let class = glib::FlagsClass::with_type(target)
-            .ok_or_else(|| format!("Cannot read the flags class of {}", target_name))?;
-        let mask = class.values().iter().fold(0u32, |m, v| m | v.value());
-        let bits = u32::try_from(n)
-            .ok()
-            .filter(|b| b & !mask == 0)
-            .ok_or_else(|| {
-                format!(
-                    "{} sets bits that are not part of {} (valid mask: {:#x})",
-                    n, target_name, mask
-                )
-            })?;
-        return glib::Value::deserialize_with_pspec(&bits.to_string(), pspec)
-            .map_err(|_| format!("Cannot set {} to {}", target_name, bits));
+        let bits =
+            u32::try_from(n).map_err(|_| format!("{} is not a {} bitmask", n, target_name))?;
+        return deserialized_value(pspec, &bits.to_string(), target_name);
     }
 
     // Numbers: convert into the property's own type and reject anything outside
@@ -896,10 +881,7 @@ fn checked_property_value(
                 .map(|p| (p.minimum() as i128, p.maximum() as i128))
                 .unwrap_or((<$rust>::MIN as i128, <$rust>::MAX as i128));
             if n < min || n > max {
-                return Err(format!(
-                    "Value {} is out of range for {} ({}..={})",
-                    n, target_name, min, max
-                ));
+                return Err(out_of_range(n, target_name, min, max));
             }
             Ok((n as $rust).to_value())
         }};
@@ -914,10 +896,7 @@ fn checked_property_value(
                 .unwrap_or((<$rust>::MIN as f64, <$rust>::MAX as f64));
             // A NaN fails this comparison too, which is what we want.
             if !(min..=max).contains(&n) {
-                return Err(format!(
-                    "Value {} is out of range for {} ({}..={})",
-                    n, target_name, min, max
-                ));
+                return Err(out_of_range(n, target_name, min, max));
             }
             Ok((n as $rust).to_value())
         }};
@@ -932,14 +911,122 @@ fn checked_property_value(
         glib::Type::U64 => ranged_int!(glib::ParamSpecUInt64, u64),
         glib::Type::F32 => ranged_float!(glib::ParamSpecFloat, f32),
         glib::Type::F64 => ranged_float!(glib::ParamSpecDouble, f64),
-        // Everything else (caps, structures, fractions, boxed and object types,
-        // and the C `long` types glib-rs cannot build a `Value` for) is only
-        // reachable through the string form above.
-        _ => Err(format!(
-            "Property of type {} cannot be set from {}; send it as a string",
-            target_name,
-            describe(prop_value)
-        )),
+        // Everything else — booleans written as 0/1, fractions, caps,
+        // structures, boxed and object types, and the C `long` types glib-rs
+        // cannot build a `Value` for — is only reachable through the
+        // deserializer, so hand it the value's text form. A pad property
+        // rejected here is only logged (`linking.rs`) and the flow starts
+        // misconfigured, so accept every shape GStreamer can parse.
+        _ => deserialized_value(pspec, &text_form(prop_value), target_name),
+    }
+}
+
+/// Build a value from its text form and check the result against the spec.
+///
+/// `gst_value_deserialize` parses text into the property's type but never
+/// consults the `GParamSpec`, so `"-5"` for a `gint` whose minimum is `-1`
+/// comes back happily — GLib then clamps it and panics because it had to.
+/// `-5` in its integer form is rejected before it gets that far; two
+/// spellings of one value must not differ, and `catch_unwind` is a backstop
+/// rather than the guard an ordinary request runs into.
+fn deserialized_value(
+    pspec: &glib::ParamSpec,
+    text: &str,
+    target_name: &str,
+) -> Result<glib::Value, String> {
+    let value = glib::Value::deserialize_with_pspec(text, pspec)
+        .map_err(|_| format!("Cannot parse \"{}\" as {}", text, target_name))?;
+    check_against_spec(pspec, &value, target_name)?;
+    Ok(value)
+}
+
+/// Reject a deserialized value the `GParamSpec` would have to clamp.
+///
+/// Enums need no check here: GStreamer's deserializer resolves them through
+/// the enum class and fails on a name, nick or integer that is not a member.
+/// Flags and the ranged numeric types do — the deserializer assembles those
+/// arithmetically and hands back whatever it read.
+fn check_against_spec(
+    pspec: &glib::ParamSpec,
+    value: &glib::Value,
+    target_name: &str,
+) -> Result<(), String> {
+    let target = pspec.value_type();
+
+    if target.is_a(glib::Type::FLAGS) {
+        let class = glib::FlagsClass::with_type(target)
+            .ok_or_else(|| format!("Cannot read the flags class of {}", target_name))?;
+        let mask = class.values().iter().fold(0u32, |m, v| m | v.value());
+        // Flags transform to their integer form; a class GLib cannot transform
+        // is left to the `catch_unwind`.
+        if let Some(bits) = value
+            .transform::<u32>()
+            .ok()
+            .and_then(|v| v.get::<u32>().ok())
+        {
+            if bits & !mask != 0 {
+                return Err(format!(
+                    "{} sets bits that are not part of {} (valid mask: {:#x})",
+                    bits, target_name, mask
+                ));
+            }
+        }
+        return Ok(());
+    }
+
+    macro_rules! check_int {
+        ($spec:ty, $rust:ty) => {{
+            if let (Some(p), Ok(n)) = (pspec.downcast_ref::<$spec>(), value.get::<$rust>()) {
+                let (n, min, max) = (n as i128, p.minimum() as i128, p.maximum() as i128);
+                if n < min || n > max {
+                    return Err(out_of_range(n, target_name, min, max));
+                }
+            }
+        }};
+    }
+
+    macro_rules! check_float {
+        ($spec:ty, $rust:ty) => {{
+            if let (Some(p), Ok(n)) = (pspec.downcast_ref::<$spec>(), value.get::<$rust>()) {
+                let (n, min, max) = (n as f64, p.minimum() as f64, p.maximum() as f64);
+                if !(min..=max).contains(&n) {
+                    return Err(out_of_range(n, target_name, min, max));
+                }
+            }
+        }};
+    }
+
+    match target {
+        glib::Type::I8 => check_int!(glib::ParamSpecChar, i8),
+        glib::Type::U8 => check_int!(glib::ParamSpecUChar, u8),
+        glib::Type::I32 => check_int!(glib::ParamSpecInt, i32),
+        glib::Type::U32 => check_int!(glib::ParamSpecUInt, u32),
+        glib::Type::I64 => check_int!(glib::ParamSpecInt64, i64),
+        glib::Type::U64 => check_int!(glib::ParamSpecUInt64, u64),
+        glib::Type::F32 => check_float!(glib::ParamSpecFloat, f32),
+        glib::Type::F64 => check_float!(glib::ParamSpecDouble, f64),
+        _ => {}
+    }
+
+    Ok(())
+}
+
+/// One wording for "the spec would have had to clamp this".
+fn out_of_range<T: std::fmt::Display>(n: T, target_name: &str, min: T, max: T) -> String {
+    format!(
+        "Value {} is out of range for {} ({}..={})",
+        n, target_name, min, max
+    )
+}
+
+/// The text form GStreamer's deserializer takes.
+fn text_form(prop_value: &PropertyValue) -> String {
+    match prop_value {
+        PropertyValue::String(v) => v.clone(),
+        PropertyValue::Int(v) => v.to_string(),
+        PropertyValue::UInt(v) => v.to_string(),
+        PropertyValue::Float(v) => v.to_string(),
+        PropertyValue::Bool(v) => v.to_string(),
     }
 }
 
@@ -1005,17 +1092,6 @@ fn enum_choices(class: &glib::EnumClass) -> String {
     format!("valid: {}", listed.join(", "))
 }
 
-/// What the client sent, named the way the client would recognise it.
-fn describe(prop_value: &PropertyValue) -> &'static str {
-    match prop_value {
-        PropertyValue::String(_) => "a string",
-        PropertyValue::Int(_) => "an integer",
-        PropertyValue::UInt(_) => "an integer",
-        PropertyValue::Float(_) => "a number",
-        PropertyValue::Bool(_) => "a boolean",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1044,8 +1120,8 @@ mod tests {
     }
 
     /// An integer names an enum member as well as its nick does, and the value
-    /// that comes back is the enum's own type — not the `gint64` that used to
-    /// be handed to `set_property`.
+    /// that comes back is the enum's own type, not the `gint64` the operand
+    /// arrived as.
     #[test]
     fn enum_accepts_an_in_range_integer() {
         let src = videotestsrc();
@@ -1159,12 +1235,78 @@ mod tests {
             .expect_err("`banana` is not a gboolean");
     }
 
+    /// Any shape GStreamer's deserializer can parse for the target type is
+    /// accepted, rather than turned into a type error the caller may only log.
     #[test]
-    fn string_property_rejects_a_number() {
+    fn a_number_names_a_string_property() {
         let src = videotestsrc();
-        let err = convert(&src, "name", PropertyValue::Int(5))
-            .expect_err("an integer is not a gchararray");
-        assert!(err.contains("integer"), "unhelpful message: {}", err);
+        let value = convert(&src, "name", PropertyValue::Int(5))
+            .expect("5 is a gchararray GStreamer takes");
+        assert_eq!(value.get::<String>().expect("not a gchararray"), "5");
+    }
+
+    /// Booleans arrive as 0/1 from clients that went through a form or an
+    /// untyped config. Both spellings reach the same `gboolean`.
+    #[test]
+    fn boolean_property_accepts_an_integer() {
+        let src = videotestsrc();
+        for (sent, expected) in [
+            (PropertyValue::Int(1), true),
+            (PropertyValue::Int(0), false),
+        ] {
+            let value = convert(&src, "is-live", sent).expect("0 and 1 are gbooleans");
+            assert_eq!(value.get::<bool>().expect("not a gboolean"), expected);
+        }
+    }
+
+    /// Pad properties come from the same flow definition and take the same
+    /// conversion. `linking.rs` only logs a pad property it cannot set, so a
+    /// rejection here starts the flow misconfigured instead of reporting
+    /// anything. `audiomixer`'s `sink_%u` pads carry the `mute` a mixer route
+    /// sets.
+    #[test]
+    fn pad_boolean_property_accepts_an_integer() {
+        gst::init().unwrap();
+        let mixer = gst::ElementFactory::make("audiomixer")
+            .build()
+            .expect("audiomixer missing - install gstreamer1.0-plugins-base");
+        let pad = mixer.request_pad_simple("sink_%u").expect("no sink pad");
+        let pspec = pad.find_property("mute").expect("no 'mute' on the pad");
+
+        let value = checked_property_value(&pspec, &PropertyValue::Int(1)).expect("1 is muted");
+        pad.set_property_from_value("mute", &value);
+        assert!(pad.property::<bool>("mute"));
+    }
+
+    /// The clamp path the type check misses, in its string spelling: `-5` is
+    /// below the `num-buffers` minimum whether it arrives as a number or as
+    /// text, and GLib panics on either.
+    #[test]
+    fn integer_property_rejects_an_out_of_range_string() {
+        let src = videotestsrc();
+        let err = convert(&src, "num-buffers", PropertyValue::String("-5".to_string()))
+            .expect_err("-5 is below the num-buffers minimum");
+        assert!(err.contains("-1"), "message omits the range: {}", err);
+    }
+
+    /// `rtspsrc protocols` is a `GstRTSPLowerTrans` bitmask. GStreamer's
+    /// deserializer reads a raw integer without consulting the flags class, so
+    /// stray bits arrive intact and GLib rejects them by panicking.
+    #[test]
+    fn flags_property_rejects_stray_bits_in_a_string() {
+        gst::init().unwrap();
+        let src = gst::ElementFactory::make("rtspsrc")
+            .build()
+            .expect("rtspsrc missing - install gstreamer1.0-plugins-good");
+        let pspec = src.find_property("protocols").unwrap();
+
+        let value = checked_property_value(&pspec, &PropertyValue::String("0x4".to_string()))
+            .expect("udp-mcast is a real GstRTSPLowerTrans bit");
+        src.set_property_from_value("protocols", &value);
+
+        let err = checked_property_value(&pspec, &PropertyValue::String("0xff0".to_string()))
+            .expect_err("0xff0 sets bits GstRTSPLowerTrans does not define");
+        assert!(err.contains("mask"), "message omits the mask: {}", err);
     }
 
     /// The `gdouble` coercion the mixer relies on: a client that sends volume
