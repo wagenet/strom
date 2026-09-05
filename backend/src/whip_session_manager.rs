@@ -510,6 +510,10 @@ struct IdlestSession {
     cleanup_sent: Arc<AtomicBool>,
 }
 
+/// How long to wait for a session pipeline that returns ASYNC from its
+/// transition to NULL. Bounded because the wait runs on a blocking thread.
+const TEARDOWN_TIMEOUT: gst::ClockTime = gst::ClockTime::from_seconds(5);
+
 impl WhipSessionManager {
     pub fn new() -> Self {
         let (cleanup_tx, cleanup_rx) = mpsc::unbounded_channel();
@@ -928,11 +932,25 @@ impl WhipSessionManager {
             name
         );
 
-        if let Err(e) = session_pipeline.set_state(gst::State::Null) {
-            warn!(
+        match session_pipeline.set_state(gst::State::Null) {
+            // Nothing in a session pipeline goes async on the way down today,
+            // but an element that did would have the pipeline dropped out from
+            // under a transition still in flight, leaving its children to be
+            // disposed above NULL.
+            Ok(gst::StateChangeSuccess::Async) => {
+                let (result, current, _) = session_pipeline.state(TEARDOWN_TIMEOUT);
+                if result.is_err() || current != gst::State::Null {
+                    warn!(
+                        "WhipSessionManager: Session pipeline {} did not reach Null within {:?} (current: {:?})",
+                        name, TEARDOWN_TIMEOUT, current
+                    );
+                }
+            }
+            Ok(_) => {}
+            Err(e) => warn!(
                 "WhipSessionManager: Failed to set session pipeline {} to Null: {:?}",
                 name, e
-            );
+            ),
         }
     }
 }
