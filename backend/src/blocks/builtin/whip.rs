@@ -279,6 +279,24 @@ fn stamp_slot_output(tee: &gst::Element, stamp: Arc<ActivityStamp>, slot: usize,
     );
 }
 
+/// Keep a slot with no publisher from holding the pipeline out of PLAYING.
+///
+/// A `decodebin` cannot complete READY->PAUSED until data arrives and it can
+/// typefind, and a pipeline with any child still ASYNC never completes its own
+/// transition. Two guards, for the two moments this bites:
+/// - Locked state keeps an idle slot out of the pipeline's state changes
+///   entirely: it sits in NULL and contributes nothing to the aggregated state.
+/// - `async-handling` makes the decodebin absorb its own ASYNC once unlocked,
+///   so a slot claimed by a session that then sends no media cannot pull a
+///   running pipeline back out of PLAYING.
+///
+/// Neither hides a real preroll failure: a decodebin that errors still posts
+/// its ERROR to the pipeline bus.
+fn prepare_idle_decodebin(decodebin: &gst::Element) {
+    decodebin.set_property("async-handling", true);
+    decodebin.set_locked_state(true);
+}
+
 /// Build WHIP Input per-slot output chains.
 ///
 /// At build time, per-slot chains are created in the main pipeline:
@@ -293,24 +311,7 @@ fn stamp_slot_output(tee: &gst::Element, stamp: Arc<ActivityStamp>, slot: usize,
 /// A slot's `decodebin` starts with its state locked (see
 /// `prepare_idle_decodebin`); `WhipEndpointConfig::allocate_slot` unlocks it
 /// when a session claims the slot.
-/// Keep a slot with no publisher from holding the pipeline out of PLAYING.
 ///
-/// A `decodebin` cannot complete READY->PAUSED until data arrives and it can
-/// typefind, and a pipeline with any child still ASYNC never completes its own
-/// transition. Two guards, for the two moments that bites:
-/// - Locked state keeps an idle slot out of the pipeline's state changes
-///   entirely: it sits in NULL and contributes nothing to the aggregated state.
-/// - `async-handling` makes the decodebin absorb its own ASYNC once unlocked,
-///   so a slot claimed by a session that then sends no media cannot pull a
-///   running pipeline back out of PLAYING.
-///
-/// Neither hides a real preroll failure: a decodebin that errors still posts
-/// its ERROR to the pipeline bus.
-fn prepare_idle_decodebin(decodebin: &gst::Element) {
-    decodebin.set_property("async-handling", true);
-    decodebin.set_locked_state(true);
-}
-
 /// Public so tests can build the slot chains on a host without ICE elements —
 /// `WHIPInputBuilder::build` refuses there, but the slot chains themselves use
 /// nothing from `gst-plugins-rs`.
