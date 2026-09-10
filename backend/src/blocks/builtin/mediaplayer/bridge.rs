@@ -583,16 +583,16 @@ pub fn watch_internal_bus(
 
 #[cfg(test)]
 mod tests {
-    use super::super::state::Playlist;
     use super::*;
-    use std::sync::atomic::{AtomicBool, AtomicI64};
-    use std::sync::{Mutex, RwLock};
+    use crate::blocks::builtin::mediaplayer::state::Playlist;
+    use crate::gst::pipeline_bridge::test_support::{at, Harness, SessionPipeline};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::RwLock;
+    use uuid::Uuid;
 
-    /// The bare minimum for the two pipeline constructors: they read `sync` and
-    /// stash a weak ref to the source element, nothing else, before returning.
-    fn test_state() -> Arc<MediaPlayerState> {
+    fn test_state(main_pipeline: &Harness) -> Arc<MediaPlayerState> {
         Arc::new(MediaPlayerState {
-            instance_id: uuid::Uuid::new_v4(),
+            instance_id: Uuid::new_v4(),
             source_element: gst::glib::WeakRef::new(),
             internal_pipeline: RwLock::new(None),
             video_appsrc: None,
@@ -604,17 +604,62 @@ mod tests {
             is_paused: AtomicBool::new(false),
             loop_playlist: AtomicBool::new(false),
             block_id: "test".to_string(),
-            flow_id: uuid::Uuid::new_v4(),
+            flow_id: Uuid::new_v4(),
             switching_file: AtomicBool::new(false),
             video_linked: AtomicBool::new(false),
             audio_linked: AtomicBool::new(false),
-            decode: true,
-            sync: true,
-            media_path: std::env::temp_dir(),
-            ts_offset: Arc::new(AtomicI64::new(i64::MIN)),
-            main_pipeline: gst::glib::WeakRef::new(),
-            bus_watch: Mutex::new(None),
+            decode: false,
+            sync: false,
+            media_path: std::path::PathBuf::from("/media"),
+            bridge: Arc::new(pipeline_bridge::SessionBridge::new()),
+            main_pipeline: main_pipeline.pipeline_weak(),
+            bus_watch: std::sync::Mutex::new(None),
         })
+    }
+
+    /// The wiring guard for this block. [`pipeline_bridge`] can only promise
+    /// that `SessionBridge::forward` drops an unstamped buffer; it cannot
+    /// promise this bridge still calls it. So drive the real appsink callback
+    /// that [`link_pad_through_clocksync`] installs: three buffers in, the
+    /// middle one with no PTS, and only the two stamped ones may reach the
+    /// appsrc in the main pipeline.
+    ///
+    /// In passthrough mode this block's output reaches the same `qtmux` as a
+    /// WHIP seat's, where an unstamped buffer answers `GST_FLOW_ERROR` and
+    /// takes the whole flow down.
+    #[test]
+    fn an_unstamped_buffer_never_reaches_the_main_pipeline() {
+        let main = Harness::new();
+        let session = SessionPipeline::new();
+        let state = test_state(&main);
+
+        session.start();
+        link_pad_through_clocksync(
+            &session.pipeline,
+            &session.src_pad(),
+            &main.src,
+            &state,
+            "test_clocksync",
+            "test_appsink",
+            false,
+            "video",
+        )
+        .expect("bridge chain");
+
+        session.push(at(1));
+        session.push(None);
+        session.push(at(3));
+
+        let first = main.next_pts().expect("first buffer crossed");
+        assert!(first.is_some(), "a stamped buffer must keep its stamp");
+        let second = main.next_pts().expect("the third buffer crossed too");
+        assert!(
+            second.is_some(),
+            "the unstamped buffer must not be here — the third one is next"
+        );
+        assert!(second > first, "and it must follow the first");
+        assert_eq!(main.next_pts(), None, "nothing else should have crossed");
+        assert_eq!(state.bridge.dropped_unstamped(), 1);
     }
 
     /// An `rtsp://` URI makes `uridecodebin`/`urisourcebin` autoplug an RTP
@@ -654,7 +699,7 @@ mod tests {
             // GStreamer < 1.24: aggregation does not exist, so neither does the bug.
             return;
         }
-        let state = test_state();
+        let state = test_state(&Harness::new());
         let pipeline = create_decode_pipeline("test", &state, None).unwrap();
         assert_hdrext_disabled_on_late_depayloader(&pipeline);
     }
@@ -665,7 +710,7 @@ mod tests {
         if !rtp_hdrext::is_supported() {
             return;
         }
-        let state = test_state();
+        let state = test_state(&Harness::new());
         let pipeline = create_passthrough_pipeline("test", &state, None).unwrap();
         assert_hdrext_disabled_on_late_depayloader(&pipeline);
     }
