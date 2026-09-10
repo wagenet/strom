@@ -585,12 +585,19 @@ pub fn watch_internal_bus(
 mod tests {
     use super::super::state::Playlist;
     use super::*;
-    use std::sync::atomic::{AtomicBool, AtomicI64};
+    use crate::gst::pipeline_bridge::test_support::{at, Harness, SessionPipeline};
+    use std::sync::atomic::AtomicBool;
     use std::sync::{Mutex, RwLock};
 
     /// The bare minimum for the two pipeline constructors: they read `sync` and
     /// stash a weak ref to the source element, nothing else, before returning.
     fn test_state() -> Arc<MediaPlayerState> {
+        test_state_with_main(gst::glib::WeakRef::new())
+    }
+
+    fn test_state_with_main(
+        main_pipeline: gst::glib::WeakRef<gst::Pipeline>,
+    ) -> Arc<MediaPlayerState> {
         Arc::new(MediaPlayerState {
             instance_id: uuid::Uuid::new_v4(),
             source_element: gst::glib::WeakRef::new(),
@@ -611,8 +618,8 @@ mod tests {
             decode: true,
             sync: true,
             media_path: std::env::temp_dir(),
-            ts_offset: Arc::new(AtomicI64::new(i64::MIN)),
-            main_pipeline: gst::glib::WeakRef::new(),
+            bridge: Arc::new(pipeline_bridge::SessionBridge::new()),
+            main_pipeline,
             bus_watch: Mutex::new(None),
         })
     }
@@ -668,5 +675,50 @@ mod tests {
         let state = test_state();
         let pipeline = create_passthrough_pipeline("test", &state, None).unwrap();
         assert_hdrext_disabled_on_late_depayloader(&pipeline);
+    }
+
+    /// The wiring guard for this block. [`pipeline_bridge`] can only promise
+    /// that `SessionBridge::forward` drops an unstamped buffer; it cannot
+    /// promise this bridge still calls it. So drive the real appsink callback
+    /// that [`link_pad_through_clocksync`] installs: three buffers in, the
+    /// middle one with no PTS, and only the two stamped ones may reach the
+    /// appsrc in the main pipeline.
+    ///
+    /// In passthrough mode this block's output reaches the same `qtmux` as a
+    /// WHIP seat's, where an unstamped buffer answers `GST_FLOW_ERROR` and
+    /// takes the whole flow down.
+    #[test]
+    fn an_unstamped_buffer_never_reaches_the_main_pipeline() {
+        let main = Harness::new();
+        let session = SessionPipeline::new();
+        let state = test_state_with_main(main.pipeline_weak());
+
+        session.start();
+        link_pad_through_clocksync(
+            &session.pipeline,
+            &session.src_pad(),
+            &main.src,
+            &state,
+            "test_clocksync",
+            "test_appsink",
+            false,
+            "video",
+        )
+        .expect("bridge chain");
+
+        session.push(at(1));
+        session.push(None);
+        session.push(at(3));
+
+        let first = main.next_pts().expect("first buffer crossed");
+        assert!(first.is_some(), "a stamped buffer must keep its stamp");
+        let second = main.next_pts().expect("the third buffer crossed too");
+        assert!(
+            second.is_some(),
+            "the unstamped buffer must not be here — the third one is next"
+        );
+        assert!(second > first, "and it must follow the first");
+        assert_eq!(main.next_pts(), None, "nothing else should have crossed");
+        assert_eq!(state.bridge.dropped_unstamped(), 1);
     }
 }
