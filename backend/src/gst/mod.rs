@@ -9,6 +9,7 @@ pub mod gl_bridge;
 pub mod ice_preflight;
 pub mod keyframe_request;
 pub mod pipeline;
+pub mod pipeline_bridge;
 pub mod pipeline_monitor;
 pub mod rtp_hdrext;
 pub mod shaders;
@@ -23,7 +24,6 @@ pub mod video_frame;
 pub mod vimage;
 pub mod volume_ramp;
 pub mod whep_probe;
-pub mod whip_bridge;
 
 pub use discovery::ElementDiscovery;
 pub use pipeline::{PipelineError, PipelineManager};
