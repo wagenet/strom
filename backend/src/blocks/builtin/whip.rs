@@ -776,6 +776,53 @@ fn wait_for_inactivity(
     }
 }
 
+/// Wire one session stream's appsink into its slot's appsrc in the main
+/// pipeline.
+///
+/// A function rather than an inline closure so a test can drive the callback:
+/// the guard that matters is here, not in [`pipeline_bridge`]. A bare
+/// `appsrc.push_sample(&sample)` in this body re-opens the cascade an unstamped
+/// buffer starts and fails nothing in that module's tests.
+#[allow(clippy::too_many_arguments)]
+fn install_slot_bridge(
+    appsink: &gst_app::AppSink,
+    appsrc: gst_app::AppSrc,
+    bridge: Arc<SessionBridge>,
+    main_pipeline_weak: gst::glib::WeakRef<gst::Pipeline>,
+    media_type: &str,
+    slot: usize,
+    activity: Arc<SessionActivity>,
+    session_finished: Arc<AtomicBool>,
+) {
+    let media_for_log = media_type.to_string();
+    // Resolved here, not per buffer: the pad's media type is fixed.
+    let pad_is_audio = media_type == "audio";
+
+    appsink.set_callbacks(
+        gst_app::AppSinkCallbacks::builder()
+            .new_sample(move |sink| {
+                // Media arriving from the publisher. Half of this session's
+                // liveness; the other half is stamped on the slot's output tee
+                // in the main pipeline.
+                activity.touch_ingress(pad_is_audio);
+
+                let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                forward_sample_to_slot(
+                    &sample,
+                    &appsrc,
+                    &session_finished,
+                    &bridge,
+                    &main_pipeline_weak,
+                    &media_for_log,
+                    slot,
+                )?;
+
+                Ok(gst::FlowSuccess::Ok)
+            })
+            .build(),
+    );
+}
+
 /// A whipserversrc session that has been created and is playing, handed back to
 /// the HTTP handler so it can register the session with the manager.
 pub struct CreatedSession {
@@ -1218,36 +1265,15 @@ pub fn create_whipserversrc_for_session(
                     }
                 }
 
-                let bridge = session_bridge.clone();
-                let main_pipeline_for_ts = main_pipeline_weak.clone();
-                let media_for_log = media_type.to_string();
-                let activity_cb = activity_for_pads.clone();
-                let session_finished = cleanup_sent_for_pads.clone();
-                // Resolved here, not per buffer: the pad's media type is fixed.
-                let pad_is_audio = media_type == "audio";
-
-                appsink.set_callbacks(
-                    gst_app::AppSinkCallbacks::builder()
-                        .new_sample(move |sink| {
-                            // Media arriving from the publisher. Half of this
-                            // session's liveness; the other half is stamped on
-                            // the slot's output tee in the main pipeline.
-                            activity_cb.touch_ingress(pad_is_audio);
-
-                            let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
-                            forward_sample_to_slot(
-                                &sample,
-                                &appsrc,
-                                &session_finished,
-                                &bridge,
-                                &main_pipeline_for_ts,
-                                &media_for_log,
-                                slot,
-                            )?;
-
-                            Ok(gst::FlowSuccess::Ok)
-                        })
-                        .build(),
+                install_slot_bridge(
+                    &appsink,
+                    appsrc,
+                    session_bridge.clone(),
+                    main_pipeline_weak.clone(),
+                    media_type,
+                    slot,
+                    activity_for_pads.clone(),
+                    cleanup_sent_for_pads.clone(),
                 );
             } else {
                 info!(
@@ -2158,6 +2184,67 @@ fn setup_incoming_rtp_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gst::pipeline_bridge::test_support::{at, Harness, SessionPipeline};
+
+    /// The wiring guard for this block. [`pipeline_bridge`] can only promise
+    /// that [`SessionBridge::forward`] drops an unstamped buffer; it cannot
+    /// promise this block still calls it. So drive the real appsink callback:
+    /// three buffers into a session pipeline, the middle one with no PTS, and
+    /// only the two stamped ones may reach the slot's appsrc.
+    ///
+    /// Forwarding that buffer is what makes `qtmux` answer `Buffer has no PTS`
+    /// with `GST_FLOW_ERROR`, which tears down the whole flow — every seat, not
+    /// just this one.
+    #[test]
+    fn an_unstamped_buffer_never_reaches_the_slot_appsrc() {
+        let slot_pipeline = Harness::new();
+        let session = SessionPipeline::new();
+
+        let appsink = gst_app::AppSink::builder().sync(false).build();
+        session
+            .pipeline
+            .add(appsink.upcast_ref::<gst::Element>())
+            .expect("add appsink");
+        session
+            .src
+            .link(&appsink)
+            .expect("link session appsrc to appsink");
+
+        install_slot_bridge(
+            &appsink,
+            slot_pipeline.src.clone(),
+            Arc::new(SessionBridge::new()),
+            slot_pipeline.pipeline_weak(),
+            "video",
+            0,
+            Arc::new(SessionActivity::new(
+                Instant::now(),
+                Arc::new(ActivityStamp::new(Instant::now())),
+            )),
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        session.start();
+        session.push(at(1));
+        session.push(None);
+        session.push(at(3));
+
+        let first = slot_pipeline.next_pts().expect("first buffer crossed");
+        assert!(first.is_some(), "a stamped buffer must keep its stamp");
+        let second = slot_pipeline
+            .next_pts()
+            .expect("the third buffer crossed too");
+        assert!(
+            second.is_some(),
+            "the unstamped buffer must not be here — the third one is next"
+        );
+        assert!(second > first, "and it must follow the first");
+        assert_eq!(
+            slot_pipeline.next_pts(),
+            None,
+            "nothing else should have crossed"
+        );
+    }
 
     fn props(entries: &[(&str, PropertyValue)]) -> HashMap<String, PropertyValue> {
         entries
