@@ -5,7 +5,6 @@ pub mod buffer_age_probe;
 pub(crate) mod control_bindings;
 pub(crate) mod crop;
 pub mod discovery;
-pub mod gl_bridge;
 pub mod ice_preflight;
 pub mod keyframe_request;
 pub mod orphan_guard;
@@ -20,6 +19,7 @@ pub mod thumbnail_tap;
 pub mod transitions;
 pub(crate) mod underlay;
 pub mod video_frame;
+pub mod video_input_bridge;
 /// vImage-backed video conversion. macOS only: the element wraps Accelerate.
 #[cfg(target_os = "macos")]
 pub mod vimage;
