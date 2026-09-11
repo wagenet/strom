@@ -32,7 +32,7 @@ fn elem(id: &str, ty: &str, props: Vec<(&str, PV)>) -> strom_types::Element {
 /// Flow: a white program input on video_in_0, and on dsk_in_0 a graphic whose
 /// left half is opaque red and whose right half is fully transparent
 /// (videobox pads the 160-wide red source out to 320 with border-alpha=0).
-fn build_flow(block_id: &str, output_format: &str) -> Flow {
+fn build_flow(backend: &str, block_id: &str, output_format: &str) -> Flow {
     let mut flow = Flow::new(format!("vm_keyed_alpha_{}", block_id));
     flow.blocks.push(strom_types::BlockInstance {
         id: block_id.to_string(),
@@ -42,8 +42,12 @@ fn build_flow(block_id: &str, output_format: &str) -> Flow {
             let mut p = HashMap::new();
             p.insert(
                 "compositor_preference".to_string(),
-                PV::String("cpu".to_string()),
+                PV::String(backend.to_string()),
             );
+            // The measurement tap is a plain videoconvert, which cannot take
+            // GL memory. On the GPU backend the block has to hand out system
+            // memory for the frames to be readable at all.
+            p.insert("gl_download".to_string(), PV::Bool(backend == "gpu"));
             p.insert("num_inputs".to_string(), PV::UInt(2));
             p.insert("num_dsk_inputs".to_string(), PV::String("1".to_string()));
             p.insert(
@@ -268,7 +272,7 @@ fn bright_fraction(sample: &gstreamer::Sample) -> f64 {
     bright as f64 / (w * h) as f64
 }
 
-fn run_flow(block_id: &str, output_format: &str) -> Measured {
+fn run_flow(backend: &str, block_id: &str, output_format: &str) -> Measured {
     gstreamer::init().unwrap();
     // The builder picks its videoconvert factory from the detected GPU
     // capabilities; without this the first lookup panics.
@@ -278,7 +282,7 @@ fn run_flow(block_id: &str, output_format: &str) -> Measured {
     let registry = BlockRegistry::new(temp_file.path());
     let events = EventBroadcaster::new(10);
 
-    let flow = build_flow(block_id, output_format);
+    let flow = build_flow(backend, block_id, output_format);
     let mut manager = PipelineManager::new(
         &flow,
         events,
@@ -289,7 +293,7 @@ fn run_flow(block_id: &str, output_format: &str) -> Measured {
         std::env::temp_dir(),
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     )
-    .expect("build CPU pipeline");
+    .unwrap_or_else(|e| panic!("build {} pipeline: {}", backend, e));
 
     // Count overlay frames so the multiview is only measured once the overlay
     // is actually being composited — before its first push the multiview looks
@@ -309,7 +313,9 @@ fn run_flow(block_id: &str, output_format: &str) -> Measured {
             });
     }
 
-    manager.start().expect("start CPU pipeline");
+    manager
+        .start()
+        .unwrap_or_else(|e| panic!("start {} pipeline: {}", backend, e));
 
     // DSK pads are built hidden (alpha=0) — key the graphic in.
     manager
@@ -403,12 +409,12 @@ fn run_flow(block_id: &str, output_format: &str) -> Measured {
 /// `blend` is the space `alpha_blend_format` substitutes for this
 /// `output_format`; it has to be one `compositor` will blend in, and one that
 /// converts to the requested format on the way out.
-fn assert_keyed_alpha_survives(block_id: &str, output_format: &str, blend: &str) {
-    let m = run_flow(block_id, output_format);
+fn assert_keyed_alpha_survives(backend: &str, block_id: &str, output_format: &str, blend: &str) {
+    let m = run_flow(backend, block_id, output_format);
     eprintln!(
-        "{} output_format (blends in {}): dsk left red {:.3}, dsk right white {:.3}, \
+        "{} backend, {} output_format (blends in {}): dsk left red {:.3}, dsk right white {:.3}, \
          mv bright {:.3}, pgm format {}",
-        output_format, blend, m.dsk_left_red, m.dsk_right_white, m.mv_bright, m.pgm_format
+        backend, output_format, blend, m.dsk_left_red, m.dsk_right_white, m.mv_bright, m.pgm_format
     );
     assert_eq!(
         m.pgm_format, output_format,
@@ -437,28 +443,73 @@ fn assert_keyed_alpha_survives(block_id: &str, output_format: &str, blend: &str)
 /// is named by the failure rather than hidden behind the first one to break.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn keyed_pads_keep_alpha_with_nv12_output_format() {
-    assert_keyed_alpha_survives("vmk_nv12", "NV12", "A420");
+    assert_keyed_alpha_survives("cpu", "vmk_nv12", "NV12", "A420");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn keyed_pads_keep_alpha_with_yuy2_output_format() {
-    assert_keyed_alpha_survives("vmk_yuy2", "YUY2", "A422");
+    assert_keyed_alpha_survives("cpu", "vmk_yuy2", "YUY2", "A422");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn keyed_pads_keep_alpha_with_v210_output_format() {
-    assert_keyed_alpha_survives("vmk_v210", "v210", "A422_10LE");
+    assert_keyed_alpha_survives("cpu", "vmk_v210", "v210", "A422_10LE");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn keyed_pads_keep_alpha_with_rgb_output_format() {
-    assert_keyed_alpha_survives("vmk_rgb", "RGB", "RGBA");
+    assert_keyed_alpha_survives("cpu", "vmk_rgb", "RGB", "RGBA");
+}
+
+/// Probe whether this environment can actually render through GL: the plugins
+/// being installed is not enough — on headless runners the elements exist but
+/// no context can be created. Same probe as `vision_mixer_fx_test`.
+fn gl_environment_available() -> bool {
+    gstreamer::init().unwrap();
+    if gstreamer::ElementFactory::find("gltestsrc").is_none() {
+        return false;
+    }
+    let Ok(pipeline) = gstreamer::parse::launch(
+        "gltestsrc num-buffers=3 ! video/x-raw(memory:GLMemory),format=RGBA,width=64,height=64,framerate=30/1 ! fakesink sync=false",
+    ) else {
+        return false;
+    };
+    let Ok(pipeline) = pipeline.downcast::<gstreamer::Pipeline>() else {
+        return false;
+    };
+    if pipeline.set_state(gstreamer::State::Playing).is_err() {
+        return false;
+    }
+    let bus = pipeline.bus().expect("pipeline has a bus");
+    let ok = matches!(
+        bus.timed_pop_filtered(
+            gstreamer::ClockTime::from_seconds(20),
+            &[gstreamer::MessageType::Eos, gstreamer::MessageType::Error],
+        ),
+        Some(msg) if matches!(msg.view(), gstreamer::MessageView::Eos(_))
+    );
+    let _ = pipeline.set_state(gstreamer::State::Null);
+    ok
+}
+
+/// The GPU backend reaches the same guarantee by a different route:
+/// `glvideomixerelement` is RGBA-only on both pad templates, so the blend is
+/// always RGBA and `output_format` is realised by a `glcolorconvert` after the
+/// mixer. That converter is also what makes the format negotiate at all — see
+/// `vision_mixer_gl_output_format_test`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn keyed_pads_keep_alpha_on_gpu_with_nv12_output_format() {
+    if !gl_environment_available() {
+        eprintln!("SKIP: GL environment unavailable (no context or GL elements missing)");
+        return;
+    }
+    assert_keyed_alpha_survives("gpu", "vmk_gpu_nv12", "NV12", "RGBA");
 }
 
 /// Baseline: the same flow with `output_format=Auto`, which was never broken.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn keyed_pads_keep_alpha_with_auto_output_format() {
-    let m = run_flow("vmk_auto", "");
+    let m = run_flow("cpu", "vmk_auto", "");
     eprintln!(
         "auto output_format: dsk left red {:.3}, dsk right white {:.3}, mv bright {:.3}, \
          pgm format {}",
