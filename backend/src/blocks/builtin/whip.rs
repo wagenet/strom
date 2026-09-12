@@ -29,7 +29,7 @@ use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
 use std::collections::HashMap;
 use std::net::TcpListener;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use strom_types::block::StreamMode;

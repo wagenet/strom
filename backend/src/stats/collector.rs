@@ -208,9 +208,10 @@ fn whip_endpoint_id(block: &BlockInstance) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::whip_session_manager::NewWhipSession;
+    use crate::whip_session_manager::{NewWhipSession, SessionActivity, SlotOutput};
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
+    use std::time::Instant;
     use strom_types::stats::StatValue;
 
     /// A session pipeline shaped like a real one for stats purposes: a
@@ -247,6 +248,10 @@ mod tests {
             endpoint_id: endpoint_id.to_string(),
             slot,
             cleanup_sent: Arc::new(AtomicBool::new(false)),
+            activity: Arc::new(SessionActivity::new(
+                Instant::now(),
+                Arc::new(SlotOutput::new(Instant::now())),
+            )),
         }));
     }
 

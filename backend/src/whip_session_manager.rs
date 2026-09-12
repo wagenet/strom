@@ -1460,6 +1460,7 @@ mod tests {
             decode: true,
             jitterbuffer_latency_ms: 200,
             do_retransmission: true,
+            drop_on_latency: true,
             dynamic_webrtcbin_store: Arc::new(Mutex::new(HashMap::new())),
             max_video_bitrate_kbps: 4000,
             max_sessions,
