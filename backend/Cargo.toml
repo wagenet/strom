@@ -141,12 +141,6 @@ eframe = { workspace = true }
 # Subclassing base for the vImage converter element in gst::vimage. Already a
 # transitive dependency of gstreamer-video, so naming it adds nothing to build.
 gstreamer-base.workspace = true
-
-[build-dependencies]
-chrono = "0.4"
-uuid = { version = "1.23", features = ["v4"] }
-
-[target.'cfg(target_os = "macos")'.dependencies]
 # App Nap opt-out: see backend/src/macos_app_nap.rs. Already in the tree via
 # eframe, so this adds no new crate.
 objc2-foundation = { version = "0.3", default-features = false, features = [
@@ -154,6 +148,10 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
     "NSProcessInfo",
     "NSString",
 ] }
+
+[build-dependencies]
+chrono = "0.4"
+uuid = { version = "1.23", features = ["v4"] }
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
