@@ -34,50 +34,121 @@ enum Anchor {
     Web(WebAnchor),
 }
 
+/// How soon after a take a page's first frame must arrive to be trusted as the
+/// start of its animation, and the delivery delay assumed when it is not. See
+/// `gst::stinger::web_stinger_start`.
+const PAGE_FIRST_FRAME_GRACE: std::time::Duration = std::time::Duration::from_millis(70);
+const PAGE_FIRST_FRAME_DELAY: std::time::Duration = std::time::Duration::from_millis(20);
+
 struct WebAnchor {
+    source: String,
     /// Weak, so a take in flight never keeps a stopped flow's pipeline alive.
     pad: gst::glib::WeakRef<gst::Pad>,
     probe: std::sync::Mutex<Option<gst::PadProbeId>>,
     first_pts: Arc<AtomicU64>,
+    clock: gst::Clock,
+    base_time: gst::ClockTime,
+    /// Running time at which the take changed the page's URL.
+    taken_at_ns: u64,
+    reported: std::sync::atomic::AtomicBool,
 }
 
 impl WebAnchor {
-    /// Watch `pad` for the next buffer. Installed before the page is told to
-    /// start, so its first frame cannot be missed.
-    fn watch(pad: gst::Pad) -> Option<Self> {
+    /// Note the take's running time and watch `pad` for the page's next frame.
+    /// Call it just before changing the URL, so the first frame cannot be missed.
+    fn watch(
+        source: &str,
+        pad: gst::Pad,
+        clock: gst::Clock,
+        base_time: gst::ClockTime,
+    ) -> Option<Self> {
+        let taken_at_ns = clock.time().saturating_sub(base_time).nseconds();
         let first_pts = Arc::new(AtomicU64::new(u64::MAX));
         let seen = first_pts.clone();
         // A per-buffer probe, which this codebase treats as performance
-        // critical: one atomic compare-and-set per buffer, installed for one
-        // take on a source that paints only while it animates, and removed as
-        // soon as the cut is placed.
+        // critical: one compare and at most one compare-and-set per buffer,
+        // installed for a single take and removed once the cut is placed.
+        // Frames stamped before the take do not count. cefsrc's segment starts
+        // at zero, so its timestamps are running times.
         let probe = pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
             if let Some(pts) = info.buffer().and_then(|b| b.pts()) {
-                let _ = seen.compare_exchange(
-                    u64::MAX,
-                    pts.nseconds(),
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                );
+                if pts.nseconds() >= taken_at_ns {
+                    let _ = seen.compare_exchange(
+                        u64::MAX,
+                        pts.nseconds(),
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    );
+                }
             }
             gst::PadProbeReturn::Ok
         })?;
         Some(Self {
+            source: source.to_string(),
             pad: pad.downgrade(),
             probe: std::sync::Mutex::new(Some(probe)),
             first_pts,
+            clock,
+            base_time,
+            taken_at_ns,
+            reported: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
-    /// Running time of the page's first frame, once it has been painted.
+    /// Running time at which the page's animation started, once it is known.
     fn offset_ns(&self) -> Option<i64> {
-        let pts = self.first_pts.load(Ordering::Relaxed);
-        if pts == u64::MAX {
-            return None;
+        use crate::gst::stinger::{web_stinger_start, WebStart};
+        let first = match self.first_pts.load(Ordering::Relaxed) {
+            u64::MAX => None,
+            pts => Some(self.running_time_of(pts)),
+        };
+        let now = self.clock.time().saturating_sub(self.base_time).nseconds();
+        let start = web_stinger_start(
+            first,
+            self.taken_at_ns,
+            now,
+            PAGE_FIRST_FRAME_GRACE.as_nanos() as u64,
+            PAGE_FIRST_FRAME_DELAY.as_nanos() as u64,
+        );
+        let report = !self
+            .reported
+            .swap(!matches!(start, WebStart::Waiting), Ordering::Relaxed);
+        match start {
+            WebStart::Waiting => None,
+            WebStart::FirstFrame(ns) => {
+                if report {
+                    debug!(
+                        "HTML graphic {}: first frame {} ms after the take",
+                        self.source,
+                        ns.saturating_sub(self.taken_at_ns) / 1_000_000
+                    );
+                }
+                i64::try_from(ns).ok()
+            }
+            WebStart::FromTake(ns) => {
+                if report {
+                    warn!(
+                        "HTML graphic {}: no frame within {} ms of the take{}, so the cut is \
+                         timed from the take and may be a frame out. A stinger page should \
+                         change something visible on its first frame",
+                        self.source,
+                        PAGE_FIRST_FRAME_GRACE.as_millis(),
+                        first
+                            .map(|f| format!(
+                                " (first came after {} ms)",
+                                f.saturating_sub(self.taken_at_ns) / 1_000_000
+                            ))
+                            .unwrap_or_default()
+                    );
+                }
+                i64::try_from(ns).ok()
+            }
         }
+    }
+
+    fn running_time_of(&self, pts: u64) -> u64 {
         let pts = gst::ClockTime::from_nseconds(pts);
-        let running = self
-            .pad
+        self.pad
             .upgrade()
             .and_then(|pad| pad.sticky_event::<gst::event::Segment>(0))
             .and_then(|ev| {
@@ -85,8 +156,8 @@ impl WebAnchor {
                     .downcast_ref::<gst::ClockTime>()
                     .and_then(|seg| seg.to_running_time(pts))
             })
-            .unwrap_or(pts);
-        i64::try_from(running.nseconds()).ok()
+            .unwrap_or(pts)
+            .nseconds()
     }
 
     fn stop_watching(&self) {
@@ -121,6 +192,8 @@ enum Overlay {
     Web {
         cefsrc: gst::Element,
         output: gst::Pad,
+        clock: gst::Clock,
+        base_time: gst::ClockTime,
         /// Page URL without a fragment; the take owns the fragment.
         base_url: String,
     },
@@ -243,10 +316,12 @@ impl AppState {
                         let output = m
                             .block_element(&binding.source_block_id, html_graphic::OUTPUT_ELEMENT)?
                             .static_pad("src")?;
-                        Some((cefsrc, output))
+                        let clock = m.pipeline().clock()?;
+                        let base_time = m.pipeline().base_time()?;
+                        Some((cefsrc, output, clock, base_time))
                     })
                 };
-                let Some((cefsrc, output)) = elements else {
+                let Some((cefsrc, output, clock, base_time)) = elements else {
                     return self
                         .cut_without_the_overlay(
                             flow_id,
@@ -267,6 +342,8 @@ impl AppState {
                     Overlay::Web {
                         cefsrc,
                         output,
+                        clock,
+                        base_time,
                         base_url,
                     },
                     duration_ms,
@@ -340,8 +417,10 @@ impl AppState {
             Overlay::Web {
                 cefsrc,
                 output,
+                clock,
+                base_time,
                 base_url,
-            } => match WebAnchor::watch(output) {
+            } => match WebAnchor::watch(&binding.source_block_id, output, clock, base_time) {
                 Some(anchor) => {
                     // A new fragment is a same-document navigation: the loaded
                     // page gets hashchange and starts its animation, rather than
