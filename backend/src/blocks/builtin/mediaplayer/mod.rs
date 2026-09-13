@@ -215,7 +215,7 @@ mod tests {
         assert_eq!(def.id, "builtin.media_player");
         assert_eq!(def.category, "Inputs");
         assert!(def.built_in);
-        assert_eq!(def.exposed_properties.len(), 8);
+        assert_eq!(def.exposed_properties.len(), 9);
 
         let decode = def
             .exposed_properties
