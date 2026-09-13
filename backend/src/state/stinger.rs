@@ -1,14 +1,18 @@
 //! Running a stinger take.
 //!
 //! Resolution and validation live in `gst::stinger`; this is the half that
-//! touches the pipeline: claiming the mixer, starting the clip, landing the
+//! touches the pipeline: claiming the mixer, starting the overlay, landing the
 //! transition beneath on the right frame, and tearing down afterwards.
 
 use super::AppState;
+use crate::blocks::builtin::html_graphic;
 use crate::blocks::builtin::mediaplayer::{
     MediaPlayerKey, MediaPlayerState, MEDIA_PLAYER_REGISTRY,
 };
 use crate::gst::pipeline::PipelineError;
+use gstreamer as gst;
+use gstreamer::prelude::*;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use strom_types::{FlowId, StromEvent};
 use tracing::{debug, error, warn};
@@ -19,6 +23,109 @@ struct CutGuard {
     _release: std::sync::mpsc::SyncSender<()>,
 }
 
+/// Where the overlay's time zero sits in the mixer's timeline, which is what
+/// places the cut point on an output frame.
+enum Anchor {
+    /// The media player's bridge maps clip time onto the main pipeline once its
+    /// first buffer after `play()` arrives.
+    Clip(Arc<MediaPlayerState>),
+    /// The first frame the page paints after the take. An idle page paints
+    /// nothing, so that frame is the animation's first.
+    Web(WebAnchor),
+}
+
+struct WebAnchor {
+    /// Weak, so a take in flight never keeps a stopped flow's pipeline alive.
+    pad: gst::glib::WeakRef<gst::Pad>,
+    probe: std::sync::Mutex<Option<gst::PadProbeId>>,
+    first_pts: Arc<AtomicU64>,
+}
+
+impl WebAnchor {
+    /// Watch `pad` for the next buffer. Installed before the page is told to
+    /// start, so its first frame cannot be missed.
+    fn watch(pad: gst::Pad) -> Option<Self> {
+        let first_pts = Arc::new(AtomicU64::new(u64::MAX));
+        let seen = first_pts.clone();
+        // A per-buffer probe, which this codebase treats as performance
+        // critical: one atomic compare-and-set per buffer, installed for one
+        // take on a source that paints only while it animates, and removed as
+        // soon as the cut is placed.
+        let probe = pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+            if let Some(pts) = info.buffer().and_then(|b| b.pts()) {
+                let _ = seen.compare_exchange(
+                    u64::MAX,
+                    pts.nseconds(),
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
+            }
+            gst::PadProbeReturn::Ok
+        })?;
+        Some(Self {
+            pad: pad.downgrade(),
+            probe: std::sync::Mutex::new(Some(probe)),
+            first_pts,
+        })
+    }
+
+    /// Running time of the page's first frame, once it has been painted.
+    fn offset_ns(&self) -> Option<i64> {
+        let pts = self.first_pts.load(Ordering::Relaxed);
+        if pts == u64::MAX {
+            return None;
+        }
+        let pts = gst::ClockTime::from_nseconds(pts);
+        let running = self
+            .pad
+            .upgrade()
+            .and_then(|pad| pad.sticky_event::<gst::event::Segment>(0))
+            .and_then(|ev| {
+                ev.segment()
+                    .downcast_ref::<gst::ClockTime>()
+                    .and_then(|seg| seg.to_running_time(pts))
+            })
+            .unwrap_or(pts);
+        i64::try_from(running.nseconds()).ok()
+    }
+
+    fn stop_watching(&self) {
+        if let Some(probe) = self.probe.lock().ok().and_then(|mut p| p.take()) {
+            if let Some(pad) = self.pad.upgrade() {
+                pad.remove_probe(probe);
+            }
+        }
+    }
+}
+
+impl Drop for WebAnchor {
+    fn drop(&mut self) {
+        self.stop_watching();
+    }
+}
+
+impl Anchor {
+    fn offset_ns(&self) -> Option<i64> {
+        match self {
+            Anchor::Clip(player) => player.stream_offset_ns(),
+            Anchor::Web(web) => web.offset_ns(),
+        }
+    }
+}
+
+/// The overlay a validated take will start, and how long it runs.
+enum Overlay {
+    Clip {
+        player: Arc<MediaPlayerState>,
+    },
+    Web {
+        cefsrc: gst::Element,
+        output: gst::Pad,
+        /// Page URL without a fragment; the take owns the fragment.
+        base_url: String,
+    },
+}
+
 /// What the spawned half of a take needs once validation has passed.
 struct Take {
     flow: FlowId,
@@ -27,17 +134,17 @@ struct Take {
     dsk_index: usize,
     token: u64,
     cut_point_ms: u64,
-    clip_ms: u64,
+    length_ms: u64,
     from_input: usize,
     to_input: usize,
     under: String,
     under_ms: u64,
     played_at: std::time::Instant,
-    player: Arc<MediaPlayerState>,
+    anchor: Anchor,
 }
 
 impl AppState {
-    /// How long past the cut point to keep waiting for the clip to reach the
+    /// How long past the cut point to keep waiting for the overlay to reach the
     /// mixer before giving up on anchoring and cutting on wall clock.
     const STINGER_ANCHOR_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
     const STINGER_ANCHOR_POLL: std::time::Duration = std::time::Duration::from_millis(2);
@@ -45,13 +152,13 @@ impl AppState {
     /// means the cut lands late, not that the mixer stays blocked.
     const STINGER_MAX_HOLD: std::time::Duration = std::time::Duration::from_millis(250);
 
-    /// Trigger a stinger: play a keyed clip over the program while another
+    /// Trigger a stinger: play a keyed overlay over the program while another
     /// transition runs beneath it.
     ///
     /// Everything that can be rejected is rejected before anything moves on
-    /// air, so a bad request leaves the program untouched. Once the clip is
-    /// rolling, a single task drives the rest: the underlying transition at the
-    /// cut point, then teardown and re-arm when the clip ends.
+    /// air, so a bad request leaves the program untouched. Once the overlay is
+    /// running, a single task drives the rest: the underlying transition at the
+    /// cut point, then teardown when the overlay ends.
     #[allow(clippy::too_many_arguments)]
     pub async fn trigger_stinger(
         &self,
@@ -61,8 +168,7 @@ impl AppState {
         to_input: usize,
         source_block_id: Option<&str>,
     ) -> Result<String, PipelineError> {
-        use crate::blocks::builtin::mediaplayer::{MediaPlayerKey, MEDIA_PLAYER_REGISTRY};
-        use crate::gst::stinger::{self, StingerError};
+        use crate::gst::stinger::{self, StingerError, StingerSourceKind};
         use crate::gst::transitions::TransitionType;
 
         // --- Validation. Nothing below this block touches the pipeline. ---
@@ -79,8 +185,8 @@ impl AppState {
             )?
         };
 
-        // Cut point and the transition beneath are properties of the clip, not
-        // of the take: the person who cut the clip knows where it covers.
+        // Cut point and the transition beneath are properties of the source,
+        // not of the take: whoever made the artwork knows where it covers.
         let under_name = binding.under_transition.clone();
         let under_duration_ms = binding.under_duration_ms;
         let under_type: TransitionType = under_name
@@ -90,55 +196,101 @@ impl AppState {
             return Err(StingerError::StingerBeneathStinger.into());
         }
 
-        let key = MediaPlayerKey {
-            flow_id: *flow_id,
-            block_id: binding.source_block_id.clone(),
-        };
-        let player = MEDIA_PLAYER_REGISTRY
-            .get(&key)
-            .ok_or_else(|| StingerError::UnknownSource(binding.source_block_id.clone()))?;
-
-        // Clip length drives the stinger; duration_ms is the transition beneath.
+        // The overlay's length, whether it is ready, and how the take starts it.
         //
-        // No readable duration means the clip is missing or undecodable. Degrade
-        // rather than reject: a broken clip must not leave the program
-        // mid-transition. The mixer is not claimed yet, so nothing to release.
-        let Some(clip_ms) = player
-            .duration()
-            .map(|ns| ns / 1_000_000)
-            .filter(|ms| *ms > 0)
-        else {
-            return self
-                .cut_without_the_clip(
-                    flow_id,
-                    block_instance_id,
-                    &binding.source_block_id,
-                    from_input,
-                    to_input,
-                    &under_name,
-                    under_duration_ms,
-                    "clip has no readable duration (missing or undecodable)",
+        // An overlay that cannot run degrades rather than rejects: a broken
+        // source must not leave the program mid-transition. The mixer is not
+        // claimed yet, so nothing to release.
+        let (overlay, length_ms, armed) = match binding.kind {
+            StingerSourceKind::Clip => {
+                let key = MediaPlayerKey {
+                    flow_id: *flow_id,
+                    block_id: binding.source_block_id.clone(),
+                };
+                let player = MEDIA_PLAYER_REGISTRY
+                    .get(&key)
+                    .ok_or_else(|| StingerError::UnknownSource(binding.source_block_id.clone()))?;
+                // No readable duration means the clip is missing or undecodable.
+                let Some(clip_ms) = player
+                    .duration()
+                    .map(|ns| ns / 1_000_000)
+                    .filter(|ms| *ms > 0)
+                else {
+                    return self
+                        .cut_without_the_overlay(
+                            flow_id,
+                            block_instance_id,
+                            &binding.source_block_id,
+                            from_input,
+                            to_input,
+                            &under_name,
+                            under_duration_ms,
+                            "clip has no readable duration (missing or undecodable)",
+                        )
+                        .await;
+                };
+                let armed = player.is_stinger_armed();
+                (Overlay::Clip { player }, clip_ms, armed)
+            }
+            StingerSourceKind::Web { duration_ms } => {
+                let elements = {
+                    let pipelines = self.inner.pipelines.read().await;
+                    pipelines.get(flow_id).and_then(|m| {
+                        let cefsrc = m.block_element(
+                            &binding.source_block_id,
+                            html_graphic::CEFSRC_ELEMENT,
+                        )?;
+                        let output = m
+                            .block_element(&binding.source_block_id, html_graphic::OUTPUT_ELEMENT)?
+                            .static_pad("src")?;
+                        Some((cefsrc, output))
+                    })
+                };
+                let Some((cefsrc, output)) = elements else {
+                    return self
+                        .cut_without_the_overlay(
+                            flow_id,
+                            block_instance_id,
+                            &binding.source_block_id,
+                            from_input,
+                            to_input,
+                            &under_name,
+                            under_duration_ms,
+                            "HTML graphic is not running",
+                        )
+                        .await;
+                };
+                let url = cefsrc.property::<Option<String>>("url").unwrap_or_default();
+                let base_url = url.split('#').next().unwrap_or_default().to_string();
+                let armed = cefsrc.current_state() == gst::State::Playing;
+                (
+                    Overlay::Web {
+                        cefsrc,
+                        output,
+                        base_url,
+                    },
+                    duration_ms,
+                    armed,
                 )
-                .await;
+            }
         };
 
-        // A cut point is optional; without one, cut where a covering clip is
+        // A cut point is optional; without one, cut where a covering overlay is
         // most likely to be opaque.
-        let cut_point = binding.cut_point_ms.unwrap_or(clip_ms / 2);
+        let cut_point = binding.cut_point_ms.unwrap_or(length_ms / 2);
         let (under_ms, clamped_from) =
-            stinger::fit_under_transition(cut_point, under_duration_ms, clip_ms)?;
+            stinger::fit_under_transition(cut_point, under_duration_ms, length_ms)?;
         if let Some(requested) = clamped_from {
             warn!(
                 "Stinger on {}: transition beneath shortened from {} ms to {} ms so it \
-                 completes before the {} ms clip ends",
-                block_instance_id, requested, under_ms, clip_ms
+                 completes before the {} ms overlay ends",
+                block_instance_id, requested, under_ms, length_ms
             );
         }
 
-        let was_armed = player.is_stinger_armed();
-        if !was_armed {
+        if !armed {
             warn!(
-                "Stinger source {} was not armed; its first frame will be late",
+                "Stinger source {} was not ready; its first frame will be late",
                 binding.source_block_id
             );
         }
@@ -177,37 +329,61 @@ impl AppState {
             return Err(e);
         }
 
-        // A clip that will not play costs the branding, not the cut: run the
-        // transition beneath on its own so the program still changes.
-        if let Err(e) = player.play() {
-            let _ = self
-                .set_dsk_enabled(flow_id, block_instance_id, binding.dsk_index, false)
-                .await;
-            release();
-            return self
-                .cut_without_the_clip(
-                    flow_id,
-                    block_instance_id,
-                    &binding.source_block_id,
-                    from_input,
-                    to_input,
-                    &under_name,
-                    under_ms,
-                    &e.to_string(),
-                )
-                .await;
-        }
+        // Start the overlay. One that will not start costs the branding, not
+        // the cut: run the transition beneath on its own so the program still
+        // changes.
+        let started = match overlay {
+            Overlay::Clip { player } => player
+                .play()
+                .map(|()| Anchor::Clip(player))
+                .map_err(|e| e.to_string()),
+            Overlay::Web {
+                cefsrc,
+                output,
+                base_url,
+            } => match WebAnchor::watch(output) {
+                Some(anchor) => {
+                    // A new fragment is a same-document navigation: the loaded
+                    // page gets hashchange and starts its animation, rather than
+                    // reloading.
+                    cefsrc.set_property("url", format!("{base_url}#strom-take-{token}"));
+                    Ok(Anchor::Web(anchor))
+                }
+                None => Err("could not watch the HTML graphic's output".to_string()),
+            },
+        };
+        let anchor = match started {
+            Ok(anchor) => anchor,
+            Err(reason) => {
+                let _ = self
+                    .set_dsk_enabled(flow_id, block_instance_id, binding.dsk_index, false)
+                    .await;
+                release();
+                return self
+                    .cut_without_the_overlay(
+                        flow_id,
+                        block_instance_id,
+                        &binding.source_block_id,
+                        from_input,
+                        to_input,
+                        &under_name,
+                        under_ms,
+                        &reason,
+                    )
+                    .await;
+            }
+        };
 
         self.inner.events.broadcast(StromEvent::StingerStarted {
             flow_id: *flow_id,
             block_instance_id: block_instance_id.to_string(),
             source_block_id: binding.source_block_id.clone(),
-            clip_ms,
+            clip_ms: length_ms,
             cut_point_ms: cut_point,
             under_transition: under_name.clone(),
             under_duration_ms: under_ms,
             under_duration_clamped_from: clamped_from,
-            armed: was_armed,
+            armed,
         });
 
         let state = self.clone();
@@ -218,25 +394,25 @@ impl AppState {
             dsk_index: binding.dsk_index,
             token,
             cut_point_ms: cut_point,
-            clip_ms,
+            length_ms,
             from_input,
             to_input,
             under: under_name,
             under_ms,
             played_at: std::time::Instant::now(),
-            player: player.clone(),
+            anchor,
         };
         tokio::spawn(async move { state.run_take(take).await });
 
         Ok("stinger".to_string())
     }
 
-    /// Run the transition beneath on its own, because the clip will not play.
+    /// Run the transition beneath on its own, because the overlay will not run.
     ///
-    /// A broken file costs the branding, not the cut: the program still changes
-    /// rather than being left mid-transition.
+    /// A broken source costs the branding, not the cut: the program still
+    /// changes rather than being left mid-transition.
     #[allow(clippy::too_many_arguments)]
-    async fn cut_without_the_clip(
+    async fn cut_without_the_overlay(
         &self,
         flow_id: &FlowId,
         block_instance_id: &str,
@@ -248,7 +424,7 @@ impl AppState {
         reason: &str,
     ) -> Result<String, PipelineError> {
         error!(
-            "Stinger clip on {}: {} — running the transition beneath on its own",
+            "Stinger overlay on {}: {} — running the transition beneath on its own",
             source_block_id, reason
         );
         self.inner.events.broadcast(StromEvent::StingerFailed {
@@ -270,7 +446,7 @@ impl AppState {
     }
 
     /// Land the transition beneath at the cut point, then tear the stinger down
-    /// when the clip ends.
+    /// when the overlay ends.
     async fn run_take(&self, take: Take) {
         let Take {
             flow,
@@ -279,13 +455,13 @@ impl AppState {
             dsk_index,
             token,
             cut_point_ms: cut_point,
-            clip_ms,
+            length_ms,
             from_input,
             to_input,
             under: under_name,
             under_ms,
             played_at,
-            player: clip_player,
+            anchor,
         } = take;
         let state = self;
         let claim = (flow, mixer.clone());
@@ -295,8 +471,11 @@ impl AppState {
         // point, so the take is applied before that frame is composited.
         // Dropping the guard releases it.
         let guard = state
-            .hold_mixer_before_cut(&flow, &mixer, &clip_player, cut_point, played_at)
+            .hold_mixer_before_cut(&flow, &mixer, &anchor, cut_point, played_at)
             .await;
+        if let Anchor::Web(web) = &anchor {
+            web.stop_watching();
+        }
         if guard.is_none() {
             // Nothing to anchor to: fall back to wall clock from the take.
             let elapsed = played_at.elapsed();
@@ -320,7 +499,7 @@ impl AppState {
         // Release the mixer only once the take has been applied.
         drop(guard);
         if let Err(e) = beneath {
-            // The clip is already on air, so this is the worst place to
+            // The overlay is already on air, so this is the worst place to
             // fail quietly: the graphic plays but the program never
             // changes. Report it rather than leaving it in the log.
             error!("Stinger on {}: transition beneath failed: {}", mixer, e);
@@ -333,8 +512,8 @@ impl AppState {
             });
         }
 
-        // Hold the keyed pad up for the rest of the clip.
-        let remaining = clip_ms.saturating_sub(cut_point);
+        // Hold the keyed pad up for the rest of the overlay.
+        let remaining = length_ms.saturating_sub(cut_point);
         tokio::time::sleep(std::time::Duration::from_millis(remaining)).await;
 
         if !still_ours() {
@@ -352,13 +531,15 @@ impl AppState {
             );
         }
 
-        // Re-arm so the next fire is fast again, then release the mixer.
-        if let Some(player) = MEDIA_PLAYER_REGISTRY.get(&MediaPlayerKey {
-            flow_id: flow,
-            block_id: source.clone(),
-        }) {
-            if let Err(e) = player.arm_stinger() {
-                warn!("Stinger source {} could not be re-armed: {}", source, e);
+        // Re-arm a clip so the next fire is fast again. A page resets itself.
+        if matches!(anchor, Anchor::Clip(_)) {
+            if let Some(player) = MEDIA_PLAYER_REGISTRY.get(&MediaPlayerKey {
+                flow_id: flow,
+                block_id: source.clone(),
+            }) {
+                if let Err(e) = player.arm_stinger() {
+                    warn!("Stinger source {} could not be re-armed: {}", source, e);
+                }
             }
         }
         {
@@ -378,19 +559,19 @@ impl AppState {
     /// Hold the mixer's output thread just before the frame that carries the
     /// cut point, returning a guard whose drop releases it.
     ///
-    /// A cut point is a position in the clip, but a take is applied by setting
-    /// pad properties from another thread, which races the aggregator: whether
-    /// the change reaches the frame it was meant for depends on how the mixer
-    /// happened to be scheduled. Waiting on wall clock or on the mixer's
+    /// A cut point is a position in the overlay, but a take is applied by
+    /// setting pad properties from another thread, which races the aggregator:
+    /// whether the change reaches the frame it was meant for depends on how the
+    /// mixer happened to be scheduled. Waiting on wall clock or on the mixer's
     /// reported position both land a frame out, and by different amounts on
     /// different layouts, because a mixer whose inputs all have data aggregates
     /// as soon as it can while one waiting on a live source runs to its
     /// deadline.
     ///
-    /// Anchoring removes the race. The clip's `stream_offset_ns` says where
-    /// clip time sits in the mixer's timeline, which gives the output frame
-    /// whose interval contains the cut point. Blocking the mixer's src pad on
-    /// the frame before it means the take is always applied first.
+    /// Anchoring removes the race. The anchor says where the overlay's time zero
+    /// sits in the mixer's timeline, which gives the output frame whose interval
+    /// contains the cut point. Blocking the mixer's src pad on the frame before
+    /// it means the take is always applied first.
     ///
     /// Returns `None` when there is nothing to anchor to, leaving the caller to
     /// fall back to wall clock.
@@ -398,21 +579,21 @@ impl AppState {
         &self,
         flow_id: &FlowId,
         block_instance_id: &str,
-        player: &Arc<crate::blocks::builtin::mediaplayer::MediaPlayerState>,
+        anchor: &Anchor,
         cut_point_ms: u64,
         played_at: std::time::Instant,
     ) -> Option<CutGuard> {
         let give_up =
             played_at + std::time::Duration::from_millis(cut_point_ms) + Self::STINGER_ANCHOR_GRACE;
 
-        // The offset is only known once the bridge has delivered a buffer.
+        // The offset is only known once the overlay's first frame has arrived.
         let offset = loop {
-            if let Some(o) = player.stream_offset_ns() {
+            if let Some(o) = anchor.offset_ns() {
                 break o;
             }
             if std::time::Instant::now() > give_up {
                 warn!(
-                    "Stinger on {}: clip never reported a stream offset, cutting on \
+                    "Stinger on {}: overlay never delivered a first frame, cutting on \
                      wall clock",
                     block_instance_id
                 );
@@ -455,15 +636,14 @@ impl AppState {
         // critical. Every buffer before the target costs one timestamp compare;
         // the lock and the channel run once, on the buffer it holds, and the
         // probe removes itself there. It is installed for a single take.
-        use gstreamer::prelude::PadExtManual;
-        let probe = pad.add_probe(gstreamer::PadProbeType::BUFFER, move |_, info| {
+        let probe = pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
             let Some(pts) = info.buffer().and_then(|b| b.pts()) else {
-                return gstreamer::PadProbeReturn::Ok;
+                return gst::PadProbeReturn::Ok;
             };
             if pts.nseconds() < hold_from_pts
                 || fired.swap(true, std::sync::atomic::Ordering::Relaxed)
             {
-                return gstreamer::PadProbeReturn::Ok;
+                return gst::PadProbeReturn::Ok;
             }
             if let Some(tx) = reached_tx.lock().ok().and_then(|mut g| g.take()) {
                 let _ = tx.send(pts.nseconds());
@@ -486,7 +666,7 @@ impl AppState {
                 probe_mixer,
                 waited.elapsed()
             );
-            gstreamer::PadProbeReturn::Remove
+            gst::PadProbeReturn::Remove
         })?;
 
         match tokio::time::timeout(

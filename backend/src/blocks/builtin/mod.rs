@@ -14,6 +14,7 @@ pub mod devicesrc;
 pub mod efpsrt;
 #[cfg(feature = "efp")]
 pub mod efpsrt_input;
+pub mod html_graphic;
 pub mod inter;
 pub mod latency;
 pub mod liveaudiorouter;
@@ -78,6 +79,9 @@ pub fn get_all_builtin_blocks() -> Vec<BlockDefinition> {
     // Add EFP/SRT Input blocks
     #[cfg(feature = "efp")]
     blocks.extend(efpsrt_input::get_blocks());
+
+    // Add HTML graphic blocks (cefsrc)
+    blocks.extend(html_graphic::get_blocks());
 
     // Add Inter-pipeline blocks
     blocks.extend(inter::get_blocks());
@@ -163,6 +167,7 @@ pub fn get_builder(block_definition_id: &str) -> Option<Arc<dyn BlockBuilder>> {
         "builtin.decklink_input" => Some(Arc::new(decklink::DeckLinkInputBuilder)),
         "builtin.decklink_output" => Some(Arc::new(decklink::DeckLinkOutputBuilder)),
         "builtin.local_input" => Some(Arc::new(devicesrc::LocalInputBuilder)),
+        "builtin.html_graphic" => Some(Arc::new(html_graphic::HtmlGraphicBuilder)),
         "builtin.inter_output" => Some(Arc::new(inter::InterOutputBuilder)),
         "builtin.inter_input" => Some(Arc::new(inter::InterInputBuilder)),
         "builtin.latency" => Some(Arc::new(latency::LatencyBuilder)),
