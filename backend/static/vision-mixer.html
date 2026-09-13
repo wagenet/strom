@@ -1197,7 +1197,7 @@
                 <button class="type-btn" data-type="slide" onclick="setTransitionType('slide')" title="Slide — new picture slides in over the old">SLIDE</button>
                 <button class="type-btn fx-only" data-type="wipe" onclick="setTransitionType('wipe')" title="Shader wipe (GPU FX engine)">WIPE</button>
                 <button class="type-btn fx-only" data-type="fx" onclick="setTransitionType('fx')" title="Master FX take (GPU FX engine)">FX</button>
-                <button class="type-btn" data-type="stinger" onclick="setTransitionType('stinger')" title="Stinger — a keyed clip covers the frame while the sources change beneath it">STINGER</button>
+                <button class="type-btn" data-type="stinger" onclick="setTransitionType('stinger')" title="Stinger — a keyed clip or page covers the frame while the sources change beneath it">STINGER</button>
             </div>
             <div class="type-row dir-row hidden" id="dirRow" title="Direction of motion">
                 <button class="type-btn dir-btn active" data-dir="left" onclick="setTransitionDir('left')">&#8592;</button>
@@ -1241,10 +1241,10 @@
                 <button class="type-btn fxk-btn novelty" data-fx="negative_flash" onclick="setFxKind('negative_flash')" title="Frame inverts through the crossfade">NEG</button>
                 <button class="type-btn fxk-btn novelty" data-fx="ripple" onclick="setFxKind('ripple')" title="Water ring ripples both pictures through a crossfade">RIPPLE</button>
             </div>
-            <div class="type-row hidden" id="stingerRow" title="Stinger clip and the timing it declares">
-                <label class="stinger-label">Clip:</label>
-                <select class="stinger-select" id="stingerClip" onchange="setStingerClip(this.value)" title="A Media Player with Stinger Clip Source enabled, wired to a DSK input"></select>
-                <span class="stinger-summary" id="stingerSummary" title="Declared on the clip's block, not on the take">&#8212;</span>
+            <div class="type-row hidden" id="stingerRow" title="Stinger overlay and the timing it declares">
+                <label class="stinger-label">Overlay:</label>
+                <select class="stinger-select" id="stingerClip" onchange="setStingerClip(this.value)" title="A Media Player or HTML Graphic declared as a stinger source, wired to a DSK input"></select>
+                <span class="stinger-summary" id="stingerSummary" title="Declared on the overlay's block, not on the take">&#8212;</span>
             </div>
             <div class="duration-row">
                 <label>Duration:</label>
@@ -1266,7 +1266,7 @@
             <span class="conn-dot" id="wsDot" title="WebSocket control">WS</span>
         </div>
         <span class="status-text" id="statusText">Connecting...</span>
-        <span class="shortcut-hint">v2.43-stinger | 1-9,0 = PVW | Space = AUTO | X = CUT | F = FTB | M = Hide</span>
+        <span class="shortcut-hint">v2.44-stinger | 1-9,0 = PVW | Space = AUTO | X = CUT | F = FTB | M = Hide</span>
     </div>
 
     <!-- Server-injected configuration (safe JSON encoding) -->
@@ -1824,13 +1824,13 @@
         };
 
         // What the operator needs before pressing AUTO: how long the mixer is
-        // committed for, and where under the clip the sources change.
+        // committed for, and where under the overlay the sources change.
         function renderStingerSummary() {
             const el = document.getElementById('stingerSummary');
             const clip = stingerClips[stingerSource];
             if (!clip) { el.textContent = '\u2014'; return; }
             const secs = (ms) => (ms / 1000).toFixed(1) + 's';
-            // A clip that declares no cut point is cut at its halfway mark.
+            // An overlay that declares no cut point is cut at its halfway mark.
             const cutMs = clip.cutMs || Math.round(clip.lengthMs / 2);
             const under = STINGER_UNDER_LABELS[clip.under] || clip.under;
             const beneath = (clip.under === 'cut')
@@ -1838,7 +1838,7 @@
                 : under + ' ' + clip.underMs + 'ms beneath';
             el.textContent = clip.lengthMs
                 ? secs(clip.lengthMs) + ', cut at ' + secs(cutMs) + ', ' + beneath
-                : 'clip length unknown, ' + beneath;
+                : 'length unknown, ' + beneath;
         }
 
         // The clip's length is only known to its running media player, so it
@@ -1854,7 +1854,7 @@
             }
         }
 
-        // Offer only Media Players that declare themselves stinger clip sources.
+        // Offer only Media Players and HTML Graphics declared as stinger sources.
         // Wiring one to a DSK input is not enough: an undeclared player is left
         // playing normally, so it is never held ready to fire.
         async function loadStingerSources() {
@@ -1864,12 +1864,13 @@
                 if (!resp.ok) throw new Error(resp.statusText);
                 const body = await resp.json();
                 const flow = body.flow || body;
+                const kinds = ['builtin.media_player', 'builtin.html_graphic'];
                 const sources = (flow.blocks || []).filter(b =>
-                    b.block_definition_id === 'builtin.media_player' &&
+                    kinds.includes(b.block_definition_id) &&
                     b.properties && b.properties.stinger_source === true);
                 sel.innerHTML = '';
                 if (!sources.length) {
-                    sel.innerHTML = '<option value="">no stinger clips</option>';
+                    sel.innerHTML = '<option value="">no stinger sources</option>';
                     stingerSource = '';
                     stingerClips = {};
                     renderStingerSummary();
@@ -1881,16 +1882,20 @@
                     opt.value = b.id;
                     opt.textContent = b.name || b.id;
                     sel.appendChild(opt);
+                    // A page's length is declared on its block; a clip's is only
+                    // known once its player has loaded it.
+                    const isPage = b.block_definition_id === 'builtin.html_graphic';
                     stingerClips[b.id] = {
                         cutMs: b.properties.stinger_cut_point_ms || 0,
                         under: b.properties.stinger_under_transition || 'cut',
                         underMs: b.properties.stinger_under_duration_ms || 0,
-                        lengthMs: 0,
+                        lengthMs: isPage ? (b.properties.stinger_duration_ms || 0) : 0,
+                        isPage,
                     };
                 }
                 stingerSource = sources[0].id;
                 renderStingerSummary();
-                for (const b of sources) {
+                for (const b of sources.filter(b => !stingerClips[b.id].isPage)) {
                     stingerClipLengthMs(b.id).then(ms => {
                         if (stingerClips[b.id]) stingerClips[b.id].lengthMs = ms;
                         renderStingerSummary();

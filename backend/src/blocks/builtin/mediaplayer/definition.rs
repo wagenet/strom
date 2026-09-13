@@ -62,6 +62,36 @@ pub fn media_player_definition() -> BlockDefinition {
                 persist: None,
             },
             ExposedProperty {
+                name: crate::gst::stinger::ALPHA_MODE_PROPERTY.to_string(),
+                label: "Clip Alpha".to_string(),
+                description: "How the clip encodes alpha, which a file cannot say. A premultiplied clip needs the keyed input it feeds declared premultiplied too, or it composites too dark."
+                    .to_string(),
+                property_type: PropertyType::Enum {
+                    values: vec![
+                        EnumValue {
+                            value: strom_types::vision_mixer::AlphaMode::Straight.as_str().to_string(),
+                            label: Some("Straight".to_string()),
+                        },
+                        EnumValue {
+                            value: strom_types::vision_mixer::AlphaMode::Premultiplied
+                                .as_str()
+                                .to_string(),
+                            label: Some("Premultiplied".to_string()),
+                        },
+                    ],
+                },
+                default_value: Some(PropertyValue::String(
+                    strom_types::vision_mixer::AlphaMode::default().as_str().to_string(),
+                )),
+                mapping: PropertyMapping {
+                    element_id: "_block".to_string(),
+                    property_name: crate::gst::stinger::ALPHA_MODE_PROPERTY.to_string(),
+                    transform: None,
+                },
+                live: false,
+                persist: None,
+            },
+            ExposedProperty {
                 name: "stinger_source".to_string(),
                 label: "Stinger Clip Source".to_string(),
                 description: "Declare this player as a stinger clip source. Its clip is held on its first frame so a stinger fires without decode latency, and looping is disabled so it plays once per trigger. Leave off for graphics on a keyed input that should keep playing."
