@@ -54,8 +54,9 @@ If the cut point plus the beneath duration would run past the end of the stinger
 duration is shortened so the transition finishes while the graphic is still covering. You
 are told both the duration declared and the one that was applied.
 
-The cut lands on the frame that carries the cut point, measured from the graphic's first
-frame on air, on both mixer backends.
+For a clip, the cut lands on the frame that carries the cut point, on both mixer backends.
+A page does the same when its animation changes something visible on its first frame; see
+[Timing a page](#timing-a-page).
 
 ## Firing one
 
@@ -103,15 +104,42 @@ page. The page has to cooperate:
 
 - **Start on `hashchange`.** Run the animation from the beginning each time the fragment
   changes. Strom owns the fragment, so do not use it for anything else.
-- **Stay transparent and still while idle.** The stinger's timing is taken from the first
-  frame the page paints after the take, so a page that keeps animating while idle — a
-  blinking cursor, a looping background — throws the cut off.
+- **Change something visible on the first frame.** See [Timing a page](#timing-a-page).
+- **Stay transparent and still while idle.** The keyed input is hidden between takes, but a
+  page that keeps animating while idle — a blinking cursor, a looping background — costs
+  rendering time, and its next frame is taken as the start of the take, so the cut can be a
+  frame out.
 - **End transparent.** Clear everything by the end of **Stinger Duration**. The keyed input
   is hidden at that point either way, but a page still drawing is cut off mid-frame.
 - **Load everything up front.** Fonts, images and videos the animation needs should be
   loaded when the page first opens, which is when the flow starts. Anything fetched at take
   time delays the start by however long it takes to arrive.
 - **Use a transparent background**, and size the page to the block's **Resolution**.
+
+### Timing a page
+
+The cut point is measured from the start of the page's animation, and Strom finds that
+start by watching for the first frame the page delivers after the take. Chromium only
+delivers a frame when something on screen changes, so that works exactly when the animation
+changes something visible straight away — any technique will do: CSS animations and
+transitions, `requestAnimationFrame` moving elements, canvas or SVG.
+
+A page whose animation begins invisibly delivers its first frame late: an element sliding
+in from fully off the frame, a fade up from nothing, an animation with a start delay. Some
+CSS animations also do this on the first take after the page loads, and not on later ones.
+When no frame arrives within a few frames of the take, Strom times the cut from the take
+itself instead. That keeps the cut within about a frame of the cut point, and logs a
+warning naming the graphic:
+
+```
+HTML graphic stinger_page: no frame within 70 ms of the take, so the cut is timed from the
+take and may be a frame out. A stinger page should change something visible on its first frame
+```
+
+For a cut that lands exactly on its frame every time, start the animation with something
+already on screen — the leading edge of a wipe, a first visible step of a fade. A 1-pixel
+element that changes on every animation frame also works for a design that has to open on
+an empty frame; drawing on a canvas counts too, even when what is drawn is transparent.
 
 A minimal page:
 
@@ -121,8 +149,9 @@ A minimal page:
   <script>
     const wipe = document.getElementById('wipe');
     addEventListener('hashchange', () => {
+      // Starts with a sliver on screen, so the first frame already shows it.
       wipe.animate(
-        [{ transform: 'translateX(-100%)' }, { transform: 'translateX(0)', offset: 0.4 },
+        [{ transform: 'translateX(-96%)' }, { transform: 'translateX(0)', offset: 0.4 },
          { transform: 'translateX(0)', offset: 0.6 }, { transform: 'translateX(100%)' }],
         { duration: 1000, easing: 'ease-in-out' });
     });

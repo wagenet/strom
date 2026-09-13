@@ -307,6 +307,45 @@ pub fn fit_under_transition(
     }
 }
 
+/// Where a web stinger's animation starts, in the mixer's timeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebStart {
+    /// Too soon to tell: keep waiting for the page's first frame.
+    Waiting,
+    /// The page's first frame arrived promptly, and its timestamp is the start.
+    FirstFrame(u64),
+    /// No prompt frame, so the start is estimated from when the take changed the
+    /// URL. The page may have painted nothing visible at first, or be slow.
+    FromTake(u64),
+}
+
+/// Decide where a web stinger's animation starts.
+///
+/// Chromium delivers a frame only when pixels change, so a page's first frame
+/// marks the start of its animation only if the animation changes something on
+/// screen straight away. One that opens on invisible frames (an element moving
+/// in from off frame, a fade from nothing, a delayed start) delivers its first
+/// frame late, and anchoring on it would cut late by the same amount. Its own
+/// clock started at `hashchange`, so a frame later than `grace_ns` after the
+/// take is ignored in favour of the take time plus the usual delivery delay.
+///
+/// All times are running times in nanoseconds. `first_frame_ns` only counts
+/// frames timestamped at or after `taken_at_ns`.
+pub fn web_stinger_start(
+    first_frame_ns: Option<u64>,
+    taken_at_ns: u64,
+    now_ns: u64,
+    grace_ns: u64,
+    delay_ns: u64,
+) -> WebStart {
+    let deadline = taken_at_ns.saturating_add(grace_ns);
+    match first_frame_ns {
+        Some(frame) if frame <= deadline => WebStart::FirstFrame(frame),
+        _ if now_ns > deadline => WebStart::FromTake(taken_at_ns.saturating_add(delay_ns)),
+        _ => WebStart::Waiting,
+    }
+}
+
 /// Keyed inputs a block feeds, as `(mixer block id, keyed input index)`.
 ///
 /// Compares against generated pad names rather than splitting on ':', because a
@@ -784,6 +823,42 @@ mod tests {
         ];
         let links = vec![link("mp1:video_out", "mixer1:dsk_in_0")];
         assert!(resolve_binding(&blocks, &links, "mixer1", Some("mp1")).is_ok());
+    }
+
+    const MS: u64 = 1_000_000;
+
+    #[test]
+    fn a_prompt_first_frame_marks_the_start() {
+        assert_eq!(
+            web_stinger_start(Some(1_020 * MS), 1_000 * MS, 1_030 * MS, 70 * MS, 20 * MS),
+            WebStart::FirstFrame(1_020 * MS)
+        );
+    }
+
+    #[test]
+    fn no_frame_yet_within_the_grace_period_keeps_waiting() {
+        assert_eq!(
+            web_stinger_start(None, 1_000 * MS, 1_050 * MS, 70 * MS, 20 * MS),
+            WebStart::Waiting
+        );
+    }
+
+    /// A page that opens on invisible frames paints its first frame late; the
+    /// cut must not move with it.
+    #[test]
+    fn a_late_first_frame_is_replaced_by_the_take_time() {
+        assert_eq!(
+            web_stinger_start(Some(1_300 * MS), 1_000 * MS, 1_310 * MS, 70 * MS, 20 * MS),
+            WebStart::FromTake(1_020 * MS)
+        );
+    }
+
+    #[test]
+    fn no_frame_past_the_grace_period_falls_back_to_the_take_time() {
+        assert_eq!(
+            web_stinger_start(None, 1_000 * MS, 1_071 * MS, 70 * MS, 20 * MS),
+            WebStart::FromTake(1_020 * MS)
+        );
     }
 
     #[test]
