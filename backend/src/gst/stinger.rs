@@ -1,8 +1,9 @@
 //! Stinger transitions — binding resolution and request validation.
 //!
-//! A stinger plays a keyed clip over the program while another transition runs
-//! beneath it. The clip comes from a media player block wired into one of the
-//! mixer's keyed (DSK) inputs; this module works out *which* input, and rejects
+//! A stinger plays a keyed overlay over the program while another transition
+//! runs beneath it. The overlay is a clip from a media player, or a page from an
+//! HTML graphic, wired into one of the mixer's keyed (DSK) inputs; this module
+//! works out *which* input, and rejects
 //! the requests that cannot be honoured, before anything touches the pipeline.
 //!
 //! Everything here is pure — it reasons over the flow definition, not over
@@ -10,14 +11,17 @@
 //! without a running pipeline. Execution lives in the caller.
 
 use crate::blocks::builtin::mediaplayer::{MediaPlayerKey, MEDIA_PLAYER_REGISTRY};
-use crate::blocks::builtin::vision_mixer::properties::{parse_num_dsk_inputs, parse_num_inputs};
+use crate::blocks::builtin::vision_mixer::properties::{
+    parse_dsk_alpha_modes, parse_num_dsk_inputs, parse_num_inputs,
+};
 use crate::gst::pipeline::PipelineManager;
 use strom_types::element::Link;
+use strom_types::vision_mixer::AlphaMode;
 use strom_types::Flow;
 use strom_types::{BlockInstance, FlowId};
 use tracing::{info, warn};
 
-/// Pad name a media player exposes its decoded video on.
+/// Pad name a stinger source exposes its video on.
 const SOURCE_PAD: &str = "video_out";
 
 /// Property by which a media player declares itself a stinger clip source.
@@ -27,10 +31,16 @@ const SOURCE_PAD: &str = "video_out";
 /// stop it looping. Declaration keeps stinger behaviour opt-in.
 pub const STINGER_SOURCE_PROPERTY: &str = "stinger_source";
 
-/// Property on a source block declaring how its clip's alpha is encoded.
-/// Absent means straight, which is the only kind that composites correctly.
+/// Property on a clip source declaring how its clip's alpha is encoded.
+/// Absent means straight. It has to match the keyed input it is wired to.
 pub const ALPHA_MODE_PROPERTY: &str = "alpha_mode";
-pub const ALPHA_MODE_PREMULTIPLIED: &str = "premultiplied";
+
+/// Block definition of an HTML graphic, whose page is a stinger's overlay.
+pub const HTML_GRAPHIC_BLOCK: &str = "builtin.html_graphic";
+
+/// How long a web stinger's animation runs. A page has no length of its own, so
+/// it is declared on the block.
+pub const DURATION_PROPERTY: &str = "stinger_duration_ms";
 
 /// Timing properties, which live on the clip source rather than on the take.
 /// When the clip fully covers the frame is a property of the artwork, so the
@@ -40,12 +50,44 @@ pub const CUT_POINT_PROPERTY: &str = "stinger_cut_point_ms";
 pub const UNDER_TRANSITION_PROPERTY: &str = "stinger_under_transition";
 pub const UNDER_DURATION_PROPERTY: &str = "stinger_under_duration_ms";
 
+/// Transitions a stinger can run beneath its overlay, as `(value, label)`.
+const UNDER_TRANSITION_CHOICES: &[(&str, &str)] = &[
+    ("cut", "Cut"),
+    ("fade", "Mix"),
+    ("dip_to_black", "Dip to Black"),
+    ("wipe_left", "Wipe Left"),
+    ("wipe_right", "Wipe Right"),
+    ("wipe_up", "Wipe Up"),
+    ("wipe_down", "Wipe Down"),
+];
+
+/// The transitions beneath a stinger, for a source block's property enum.
+pub fn under_transition_enum_values() -> Vec<strom_types::block::EnumValue> {
+    UNDER_TRANSITION_CHOICES
+        .iter()
+        .map(|(value, label)| strom_types::block::EnumValue {
+            value: value.to_string(),
+            label: Some(label.to_string()),
+        })
+        .collect()
+}
+
+/// What plays a stinger's overlay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StingerSourceKind {
+    /// A media player clip, which is as long as its file.
+    Clip,
+    /// An HTML graphic, whose page runs for the duration declared on the block.
+    Web { duration_ms: u64 },
+}
+
 /// Which keyed input of a mixer a stinger source feeds, and the timing the
-/// clip itself declares.
+/// source itself declares.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StingerBinding {
-    /// Block id of the media player supplying the clip.
+    /// Block id of the media player or HTML graphic supplying the overlay.
     pub source_block_id: String,
+    pub kind: StingerSourceKind,
     /// Index of the mixer's keyed (DSK) input it is wired to.
     pub dsk_index: usize,
     /// How far into the clip the program source changes. `None` means the clip
@@ -78,10 +120,22 @@ pub enum StingerError {
     #[error("mixer '{0}' has no keyed (DSK) inputs configured, so it cannot play a stinger")]
     NoKeyedInputs(String),
     #[error(
-        "clip source '{0}' declares premultiplied alpha, which is not supported — \
-         a premultiplied clip composites too dark and no compositor operator corrects it"
+        "stinger source '{source_block}' has {source_mode} alpha but keyed input \
+         {dsk_number} of mixer '{mixer}' is declared {input_mode} — set that input's \
+         alpha mode to {source_mode}, or it composites too dark or too bright"
     )]
-    PremultipliedUnsupported(String),
+    AlphaModeMismatch {
+        source_block: String,
+        mixer: String,
+        dsk_number: usize,
+        source_mode: AlphaMode,
+        input_mode: AlphaMode,
+    },
+    #[error(
+        "HTML graphic '{0}' has no stinger duration — a page has no length of its \
+         own, so set how long its animation runs"
+    )]
+    WebSourceNeedsDuration(String),
     #[error(
         "stinger cut point {cut_point_ms} ms is at or beyond the clip length \
          {clip_ms} ms, so the transition beneath would never run"
@@ -115,6 +169,19 @@ fn read_u64(block: &BlockInstance, name: &str) -> Option<u64> {
         strom_types::PropertyValue::UInt(v) => Some(*v),
         strom_types::PropertyValue::Int(v) => u64::try_from(*v).ok(),
         _ => None,
+    }
+}
+
+/// How a stinger source encodes alpha. Chromium always paints premultiplied, so
+/// an HTML graphic is premultiplied whatever it declares; a clip is what its
+/// `alpha_mode` says, straight when unset.
+fn source_alpha_mode(block: &BlockInstance) -> AlphaMode {
+    if block.block_definition_id == HTML_GRAPHIC_BLOCK {
+        return AlphaMode::Premultiplied;
+    }
+    match block.properties.get(ALPHA_MODE_PROPERTY) {
+        Some(strom_types::PropertyValue::String(mode)) => mode.parse().unwrap_or_default(),
+        _ => AlphaMode::default(),
     }
 }
 
@@ -157,20 +224,34 @@ pub fn resolve_binding(
         return Err(StingerError::SourceNotDeclared(source.to_string()));
     }
 
-    if let Some(strom_types::PropertyValue::String(mode)) =
-        source_block.properties.get(ALPHA_MODE_PROPERTY)
-    {
-        if mode.eq_ignore_ascii_case(ALPHA_MODE_PREMULTIPLIED) {
-            return Err(StingerError::PremultipliedUnsupported(source.to_string()));
+    let kind = if source_block.block_definition_id == HTML_GRAPHIC_BLOCK {
+        let duration_ms = read_u64(source_block, DURATION_PROPERTY).unwrap_or(0);
+        if duration_ms == 0 {
+            return Err(StingerError::WebSourceNeedsDuration(source.to_string()));
         }
-    }
+        StingerSourceKind::Web { duration_ms }
+    } else {
+        StingerSourceKind::Clip
+    };
+    let source_mode = source_alpha_mode(source_block);
+    let input_modes = parse_dsk_alpha_modes(&mixer_block.properties, num_dsk);
 
     let from = format!("{source}:{SOURCE_PAD}");
-    for idx in 0..num_dsk {
+    for (idx, &input_mode) in input_modes.iter().enumerate() {
         let to = format!("{mixer}:dsk_in_{idx}");
         if links.iter().any(|l| l.from == from && l.to == to) {
+            if input_mode != source_mode {
+                return Err(StingerError::AlphaModeMismatch {
+                    source_block: source.to_string(),
+                    mixer: mixer.to_string(),
+                    dsk_number: idx + 1,
+                    source_mode,
+                    input_mode,
+                });
+            }
             return Ok(StingerBinding {
                 source_block_id: source.to_string(),
+                kind,
                 dsk_index: idx,
                 cut_point_ms: read_u64(source_block, CUT_POINT_PROPERTY).filter(|ms| *ms > 0),
                 under_transition: match source_block.properties.get(UNDER_TRANSITION_PROPERTY) {
@@ -259,7 +340,16 @@ fn keyed_inputs_fed_by<'a>(
 /// before the mixer is built. Undeclared sources are untouched, which is what
 /// keeps a looping graphic on a keyed input playing.
 pub fn prepare_declared_sources(flow_id: FlowId, flow: &Flow, manager: &PipelineManager) {
+    warn_on_alpha_mismatches(flow);
+
     for block in flow.blocks.iter().filter(|b| declares_stinger_source(b)) {
+        // A page is already running and idle when the flow starts, and its last
+        // paint is transparent, so there is nothing to park and nothing stale
+        // for its keyed input to hold.
+        if block.block_definition_id == HTML_GRAPHIC_BLOCK {
+            continue;
+        }
+
         let key = MediaPlayerKey {
             flow_id,
             block_id: block.id.clone(),
@@ -300,6 +390,50 @@ pub fn prepare_declared_sources(flow_id: FlowId, flow: &Flow, manager: &Pipeline
                 );
             }
         }
+    }
+}
+
+/// Keyed inputs whose declared alpha mode disagrees with the source feeding
+/// them, as `(source, mixer, keyed input index, source mode, input mode)`.
+/// Checks every HTML graphic and every block declaring `alpha_mode`, stinger
+/// source or not.
+pub fn alpha_mismatches(flow: &Flow) -> Vec<(String, String, usize, AlphaMode, AlphaMode)> {
+    let mut out = Vec::new();
+    for source in flow.blocks.iter().filter(|b| {
+        b.block_definition_id == HTML_GRAPHIC_BLOCK
+            || b.properties.contains_key(ALPHA_MODE_PROPERTY)
+    }) {
+        let source_mode = source_alpha_mode(source);
+        for (mixer_id, dsk_index) in keyed_inputs_fed_by(&flow.blocks, &flow.links, &source.id) {
+            let Some(mixer) = flow.blocks.iter().find(|b| b.id == mixer_id) else {
+                continue;
+            };
+            let modes = parse_dsk_alpha_modes(&mixer.properties, dsk_index + 1);
+            if modes[dsk_index] != source_mode {
+                out.push((
+                    source.id.clone(),
+                    mixer_id.to_string(),
+                    dsk_index,
+                    source_mode,
+                    modes[dsk_index],
+                ));
+            }
+        }
+    }
+    out
+}
+
+fn warn_on_alpha_mismatches(flow: &Flow) {
+    for (source, mixer, dsk_index, source_mode, input_mode) in alpha_mismatches(flow) {
+        warn!(
+            "{} has {} alpha but feeds keyed input {} of {}, which is declared {} — it \
+             will composite too dark or too bright until the input's alpha mode matches",
+            source,
+            source_mode,
+            dsk_index + 1,
+            mixer,
+            input_mode
+        );
     }
 }
 
@@ -360,6 +494,7 @@ mod tests {
             resolve_binding(&blocks, &links, "mixer1", Some("mp1")).unwrap(),
             StingerBinding {
                 source_block_id: "mp1".to_string(),
+                kind: StingerSourceKind::Clip,
                 dsk_index: 1,
                 cut_point_ms: None,
                 under_transition: "cut".to_string(),
@@ -484,8 +619,10 @@ mod tests {
         assert!(declares_stinger_source(&media_player()));
     }
 
+    /// A premultiplied clip on an input declared straight would composite too
+    /// dark, so it is refused before anything plays.
     #[test]
-    fn premultiplied_source_is_rejected_before_anything_plays() {
+    fn premultiplied_clip_on_a_straight_input_is_rejected() {
         let blocks = vec![
             mixer_with_dsk(1),
             block(
@@ -495,7 +632,7 @@ mod tests {
                     (STINGER_SOURCE_PROPERTY, PropertyValue::Bool(true)),
                     (
                         ALPHA_MODE_PROPERTY,
-                        PropertyValue::String(ALPHA_MODE_PREMULTIPLIED.to_string()),
+                        PropertyValue::String("premultiplied".to_string()),
                     ),
                 ],
             ),
@@ -503,7 +640,129 @@ mod tests {
         let links = vec![link("mp1:video_out", "mixer1:dsk_in_0")];
         assert_eq!(
             resolve_binding(&blocks, &links, "mixer1", Some("mp1")),
-            Err(StingerError::PremultipliedUnsupported("mp1".to_string()))
+            Err(StingerError::AlphaModeMismatch {
+                source_block: "mp1".to_string(),
+                mixer: "mixer1".to_string(),
+                dsk_number: 1,
+                source_mode: AlphaMode::Premultiplied,
+                input_mode: AlphaMode::Straight,
+            })
+        );
+    }
+
+    #[test]
+    fn premultiplied_clip_on_a_premultiplied_input_is_accepted() {
+        let mut mixer = mixer_with_dsk(1);
+        mixer.properties.insert(
+            "dsk_0_alpha_mode".to_string(),
+            PropertyValue::String("premultiplied".to_string()),
+        );
+        let blocks = vec![
+            mixer,
+            block(
+                "mp1",
+                "builtin.media_player",
+                &[
+                    (STINGER_SOURCE_PROPERTY, PropertyValue::Bool(true)),
+                    (
+                        ALPHA_MODE_PROPERTY,
+                        PropertyValue::String("premultiplied".to_string()),
+                    ),
+                ],
+            ),
+        ];
+        let links = vec![link("mp1:video_out", "mixer1:dsk_in_0")];
+        assert!(resolve_binding(&blocks, &links, "mixer1", Some("mp1")).is_ok());
+    }
+
+    fn html_graphic(props: &[(&str, PropertyValue)]) -> BlockInstance {
+        let mut all = vec![(STINGER_SOURCE_PROPERTY, PropertyValue::Bool(true))];
+        all.extend(props.iter().cloned());
+        block("web1", HTML_GRAPHIC_BLOCK, &all)
+    }
+
+    fn premultiplied_mixer() -> BlockInstance {
+        let mut mixer = mixer_with_dsk(1);
+        mixer.properties.insert(
+            "dsk_0_alpha_mode".to_string(),
+            PropertyValue::String("premultiplied".to_string()),
+        );
+        mixer
+    }
+
+    #[test]
+    fn a_web_source_takes_its_length_from_the_block() {
+        let blocks = vec![
+            premultiplied_mixer(),
+            html_graphic(&[
+                (DURATION_PROPERTY, PropertyValue::UInt(1200)),
+                (CUT_POINT_PROPERTY, PropertyValue::UInt(500)),
+            ]),
+        ];
+        let links = vec![link("web1:video_out", "mixer1:dsk_in_0")];
+        let binding = resolve_binding(&blocks, &links, "mixer1", Some("web1")).unwrap();
+        assert_eq!(binding.kind, StingerSourceKind::Web { duration_ms: 1200 });
+        assert_eq!(binding.cut_point_ms, Some(500));
+    }
+
+    #[test]
+    fn a_web_source_without_a_duration_is_rejected() {
+        let blocks = vec![premultiplied_mixer(), html_graphic(&[])];
+        let links = vec![link("web1:video_out", "mixer1:dsk_in_0")];
+        assert_eq!(
+            resolve_binding(&blocks, &links, "mixer1", Some("web1")),
+            Err(StingerError::WebSourceNeedsDuration("web1".to_string()))
+        );
+    }
+
+    /// Chromium paints premultiplied, so a page is premultiplied even when the
+    /// block says otherwise, and a straight input refuses it.
+    #[test]
+    fn a_web_source_on_a_straight_input_is_rejected() {
+        let blocks = vec![
+            mixer_with_dsk(1),
+            html_graphic(&[
+                (DURATION_PROPERTY, PropertyValue::UInt(1000)),
+                (
+                    ALPHA_MODE_PROPERTY,
+                    PropertyValue::String("straight".to_string()),
+                ),
+            ]),
+        ];
+        let links = vec![link("web1:video_out", "mixer1:dsk_in_0")];
+        assert!(matches!(
+            resolve_binding(&blocks, &links, "mixer1", Some("web1")),
+            Err(StingerError::AlphaModeMismatch {
+                source_mode: AlphaMode::Premultiplied,
+                input_mode: AlphaMode::Straight,
+                ..
+            })
+        ));
+    }
+
+    /// A mismatch is reported for any HTML graphic, not just a stinger source.
+    #[test]
+    fn alpha_mismatches_cover_graphics_that_are_not_stingers() {
+        let flow = Flow {
+            blocks: vec![
+                mixer_with_dsk(2),
+                block("lower_third", HTML_GRAPHIC_BLOCK, &[]),
+                html_graphic(&[(DURATION_PROPERTY, PropertyValue::UInt(1000))]),
+            ],
+            links: vec![
+                link("lower_third:video_out", "mixer1:dsk_in_0"),
+                link("web1:video_out", "mixer1:dsk_in_1"),
+            ],
+            ..Flow::new("alpha")
+        };
+        let mut flagged: Vec<_> = alpha_mismatches(&flow)
+            .into_iter()
+            .map(|(source, _, idx, _, _)| (source, idx))
+            .collect();
+        flagged.sort();
+        assert_eq!(
+            flagged,
+            vec![("lower_third".to_string(), 0), ("web1".to_string(), 1)]
         );
     }
 

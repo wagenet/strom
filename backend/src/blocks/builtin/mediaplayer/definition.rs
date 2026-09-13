@@ -97,36 +97,7 @@ pub fn media_player_definition() -> BlockDefinition {
                 description: "Transition running under the clip while it covers the frame. A cut suits a clip that covers completely; a clip that does not is a reason to mix or wipe instead."
                     .to_string(),
                 property_type: PropertyType::Enum {
-                    values: vec![
-                        EnumValue {
-                            value: "cut".to_string(),
-                            label: Some("Cut".to_string()),
-                        },
-                        EnumValue {
-                            value: "fade".to_string(),
-                            label: Some("Mix".to_string()),
-                        },
-                        EnumValue {
-                            value: "dip_to_black".to_string(),
-                            label: Some("Dip to Black".to_string()),
-                        },
-                        EnumValue {
-                            value: "wipe_left".to_string(),
-                            label: Some("Wipe Left".to_string()),
-                        },
-                        EnumValue {
-                            value: "wipe_right".to_string(),
-                            label: Some("Wipe Right".to_string()),
-                        },
-                        EnumValue {
-                            value: "wipe_up".to_string(),
-                            label: Some("Wipe Up".to_string()),
-                        },
-                        EnumValue {
-                            value: "wipe_down".to_string(),
-                            label: Some("Wipe Down".to_string()),
-                        },
-                    ],
+                    values: crate::gst::stinger::under_transition_enum_values(),
                 },
                 default_value: Some(PropertyValue::String("cut".to_string())),
                 mapping: PropertyMapping {

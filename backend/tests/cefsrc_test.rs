@@ -542,3 +542,229 @@ async fn cefsrc_emits_premultiplied_alpha() {
          treating its output as premultiplied over-brightens translucent HTML graphics"
     );
 }
+
+/// A page that covers the frame for one second after every `hashchange`, with a
+/// hole in the bottom-right corner showing the program and a blue marker in the
+/// top-left while it animates. Idle, it is fully transparent and paints nothing.
+fn stinger_page_url() -> String {
+    let html = "<!doctype html><html><body style=\"margin:0;background:transparent;overflow:hidden\">\
+        <canvas id=\"c\" width=\"640\" height=\"360\"></canvas>\
+        <script>\
+        const x = document.getElementById('c').getContext('2d');\
+        let t0 = 0;\
+        function draw() {\
+          x.clearRect(0, 0, 640, 360);\
+          if (performance.now() - t0 >= 1000) return;\
+          x.fillStyle = 'rgb(255,255,0)'; x.fillRect(0, 0, 640, 360);\
+          x.clearRect(600, 320, 40, 40);\
+          x.fillStyle = 'rgb(0,0,255)'; x.fillRect(0, 0, 80, 45);\
+          requestAnimationFrame(draw);\
+        }\
+        addEventListener('hashchange', () => { t0 = performance.now(); requestAnimationFrame(draw); });\
+        </script></body></html>";
+    format!(
+        "data:text/html;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(html)
+    )
+}
+
+/// RGBA bytes of the pixel at (x, y) of an RGBA sample.
+fn rgba_pixel(sample: &gst::Sample, x: usize, y: usize) -> [u8; 4] {
+    let caps = sample.caps().expect("sample caps");
+    let info = gstreamer_video::VideoInfo::from_caps(caps).expect("video caps");
+    assert_eq!(info.format(), gstreamer_video::VideoFormat::Rgba);
+    let buffer = sample.buffer().expect("sample buffer");
+    let map = buffer.map_readable().expect("readable buffer");
+    let offset = info.offset()[0] + y * info.stride()[0] as usize + x * 4;
+    map[offset..offset + 4].try_into().unwrap()
+}
+
+/// An HTML graphic stinger cuts the program on the output frame that carries
+/// its cut point, counted from the page's first frame on air.
+///
+/// The cut is anchored to the first frame the page paints after the take; on
+/// wall clock it lands a frame or two early with a live page on the mixer. At
+/// 30 fps a 500 ms cut point is exactly 15 frames, whatever the page's phase
+/// against the mixer's frame grid.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn html_graphic_stinger_cuts_on_the_frame_its_cut_point_names() {
+    if !cefsrc_available() {
+        return;
+    }
+    strom::gpu::detect_gpu_capabilities();
+
+    const TAKES: usize = 6;
+    const CUT_MS: u64 = 500;
+    const EXPECTED_FRAMES: usize = 15;
+
+    fn block(
+        id: &str,
+        definition: &str,
+        props: &[(&str, PropertyValue)],
+    ) -> strom_types::BlockInstance {
+        strom_types::BlockInstance {
+            id: id.to_string(),
+            block_definition_id: definition.to_string(),
+            name: None,
+            properties: props
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect(),
+            position: strom_types::block::Position { x: 0.0, y: 0.0 },
+            runtime_data: None,
+            computed_external_pads: None,
+        }
+    }
+
+    let mut flow = Flow::new("html_stinger_cut");
+    for (id, colour) in [("red", "0xffff0000"), ("green", "0xff00ff00")] {
+        flow.elements.push(element(
+            id,
+            "videotestsrc",
+            &[
+                ("pattern", string("solid-color")),
+                ("foreground-color", string(colour)),
+                ("is-live", PropertyValue::Bool(true)),
+            ],
+        ));
+        flow.elements.push(element(
+            &format!("{id}_caps"),
+            "capsfilter",
+            &[(
+                "caps",
+                string("video/x-raw,width=640,height=360,framerate=30/1"),
+            )],
+        ));
+        flow.links
+            .push(link(&format!("{id}:src"), &format!("{id}_caps:sink")));
+    }
+    flow.blocks.push(block(
+        "web",
+        "builtin.html_graphic",
+        &[
+            ("url", string(&stinger_page_url())),
+            ("resolution", string("640x360")),
+            ("framerate", string("30/1")),
+            ("stinger_source", PropertyValue::Bool(true)),
+            ("stinger_duration_ms", PropertyValue::UInt(1000)),
+            ("stinger_cut_point_ms", PropertyValue::UInt(CUT_MS)),
+            ("stinger_under_transition", string("cut")),
+        ],
+    ));
+    flow.blocks.push(block(
+        "vm",
+        "builtin.vision_mixer",
+        &[
+            ("compositor_preference", string("cpu")),
+            ("num_inputs", PropertyValue::UInt(2)),
+            ("num_dsk_inputs", PropertyValue::UInt(1)),
+            ("dsk_0_alpha_mode", string("premultiplied")),
+            ("pgm_resolution", string("640x360")),
+            ("pgm_framerate", string("30")),
+            ("multiview_resolution", string("640x360")),
+        ],
+    ));
+    flow.elements
+        .push(element("pgm_convert", "videoconvert", &[]));
+    flow.elements.push(element(
+        "pgm_tap",
+        "appsink",
+        &[
+            ("caps", string("video/x-raw,format=RGBA")),
+            ("sync", PropertyValue::Bool(false)),
+            // Every frame, in order: dropping would renumber what is counted.
+            ("max-buffers", PropertyValue::UInt(400)),
+            ("drop", PropertyValue::Bool(false)),
+        ],
+    ));
+    flow.elements.push(element("mv_sink", "fakesink", &[]));
+    flow.links.push(link("red_caps:src", "vm:video_in_0"));
+    flow.links.push(link("green_caps:src", "vm:video_in_1"));
+    flow.links.push(link("web:video_out", "vm:dsk_in_0"));
+    flow.links.push(link("vm:pgm_out", "pgm_convert:sink"));
+    flow.links.push(link("pgm_convert:src", "pgm_tap:sink"));
+    flow.links.push(link("vm:multiview_out", "mv_sink:sink"));
+
+    let (state, _storage, _blocks) = new_state();
+    let flow_id = flow.id;
+    state.upsert_flow(flow).await.expect("upsert_flow");
+    state.start_flow(&flow_id).await.expect("start_flow");
+
+    let tap = running_element(&state, &flow_id, "pgm_tap")
+        .await
+        .downcast::<gst_app::AppSink>()
+        .expect("pgm_tap is an appsink");
+
+    // Let CEF initialise and load the page before the first take.
+    tokio::task::block_in_place(|| {
+        pull_until(&tap, FIRST_FRAME_TIMEOUT, |_| false);
+    });
+
+    let marker = |s: &gst::Sample| rgba_pixel(s, 20, 11)[..3] == [0, 0, 255];
+    let program = |s: &gst::Sample| {
+        let [r, g, b, _] = rgba_pixel(s, 630, 350);
+        match (r, g, b) {
+            (255, 0, 0) => Some(0),
+            (0, 255, 0) => Some(1),
+            _ => None,
+        }
+    };
+
+    let mut landed = Vec::new();
+    for take in 0..TAKES {
+        while tap
+            .try_pull_sample(gst::ClockTime::from_mseconds(1))
+            .is_some()
+        {}
+        let mut events = state.events().subscribe();
+        let (from, to) = if take % 2 == 0 { (0, 1) } else { (1, 0) };
+        state
+            .trigger_stinger(&flow_id, "vm", from, to, Some("web"))
+            .await
+            .expect("stinger must start");
+
+        let counted = tokio::task::block_in_place(|| {
+            let mut index = 0usize;
+            let mut first_marker = None;
+            let mut was = None;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                let Some(sample) = tap.try_pull_sample(gst::ClockTime::from_mseconds(500)) else {
+                    continue;
+                };
+                if first_marker.is_none() && marker(&sample) {
+                    first_marker = Some(index);
+                }
+                if let Some(now) = program(&sample) {
+                    if was.is_some_and(|w| w != now) {
+                        return first_marker.map(|m| index - m);
+                    }
+                    was = Some(now);
+                }
+                index += 1;
+            }
+            None
+        });
+        landed.push(counted);
+
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            match tokio::time::timeout_at(deadline.into(), events.recv()).await {
+                Ok(Ok(strom_types::StromEvent::StingerCompleted { .. })) => break,
+                Ok(Ok(_)) => continue,
+                other => panic!("the stinger never completed: {other:?}"),
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    drop(tap);
+    state.stop_flow(&flow_id).await.expect("stop_flow");
+
+    assert!(
+        landed.iter().all(|l| *l == Some(EXPECTED_FRAMES)),
+        "every take must change the program {EXPECTED_FRAMES} frames after the page \
+         appears; frames counted per take: {landed:?}"
+    );
+}

@@ -173,6 +173,11 @@ impl PipelineManager {
         })
     }
 
+    /// An element a block built, by its id suffix (`"{block_id}:{suffix}"`).
+    pub fn block_element(&self, block_id: &str, suffix: &str) -> Option<gst::Element> {
+        self.elements.get(&format!("{block_id}:{suffix}")).cloned()
+    }
+
     /// Get the underlying GStreamer pipeline (for debugging).
     pub fn pipeline(&self) -> &gst::Pipeline {
         &self.pipeline
