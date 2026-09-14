@@ -37,53 +37,64 @@ enum Anchor {
 /// How soon after a take a page's first frame must arrive to be trusted as the
 /// start of its animation, and the delivery delay assumed when it is not. See
 /// `gst::stinger::web_stinger_start`.
-const PAGE_FIRST_FRAME_GRACE: std::time::Duration = std::time::Duration::from_millis(70);
-const PAGE_FIRST_FRAME_DELAY: std::time::Duration = std::time::Duration::from_millis(20);
+const PAGE_FIRST_FRAME_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
+/// Measured from a take to a prompt page's first frame: ~17 ms on gstcefsrc
+/// that emits frames as Chromium paints, ~61 ms on older builds that re-send
+/// their current frame at a fixed rate and pick up a paint only on the next.
+const PAGE_FIRST_FRAME_DELAY_PAINTED: std::time::Duration = std::time::Duration::from_millis(20);
+const PAGE_FIRST_FRAME_DELAY_FIXED_RATE: std::time::Duration = std::time::Duration::from_millis(60);
 
 struct WebAnchor {
     source: String,
     /// Weak, so a take in flight never keeps a stopped flow's pipeline alive.
     pad: gst::glib::WeakRef<gst::Pad>,
     probe: std::sync::Mutex<Option<gst::PadProbeId>>,
-    created: std::time::Instant,
-    /// Timestamp of the first buffer seen, and when it was seen (ns after
-    /// `created`). Places wall time in the output's timeline.
-    seen_pts: Arc<AtomicU64>,
-    seen_at_ns: Arc<AtomicU64>,
-    /// When the take changed the URL (ns after `created`).
+    clock: gst::Clock,
+    base_time: gst::ClockTime,
+    /// Whether a baseline buffer has passed, so the next can be judged new.
+    baseline: Arc<std::sync::atomic::AtomicBool>,
+    /// Running time at which the take changed the URL; `u64::MAX` before.
     taken_at_ns: Arc<AtomicU64>,
+    /// Newest timestamp seen on the output, repeats included.
+    output_pts: Arc<AtomicU64>,
     /// Timestamp of the first frame of new content after the take.
     first_pts: Arc<AtomicU64>,
     reported: std::sync::atomic::AtomicBool,
+    delay: std::time::Duration,
 }
 
 impl WebAnchor {
     /// Watch the block's output for the page's first new frame. Wait for
-    /// [`WebAnchor::ready`] before changing the URL, then [`WebAnchor::taken`].
-    fn watch(source: &str, pad: gst::Pad) -> Option<Self> {
-        let created = std::time::Instant::now();
-        let seen_pts = Arc::new(AtomicU64::new(u64::MAX));
-        let seen_at_ns = Arc::new(AtomicU64::new(u64::MAX));
+    /// [`WebAnchor::ready`] before changing the URL, then call
+    /// [`WebAnchor::taken`].
+    fn watch(
+        source: &str,
+        pad: gst::Pad,
+        clock: gst::Clock,
+        base_time: gst::ClockTime,
+    ) -> Option<Self> {
+        let baseline = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let taken_at_ns = Arc::new(AtomicU64::new(u64::MAX));
+        let output_pts = Arc::new(AtomicU64::new(u64::MAX));
         let first_pts = Arc::new(AtomicU64::new(u64::MAX));
         let last_memory = std::sync::atomic::AtomicUsize::new(0);
-        let (p_seen_pts, p_seen_at, p_taken, p_first) = (
-            seen_pts.clone(),
-            seen_at_ns.clone(),
+        let (p_baseline, p_taken, p_output, p_first) = (
+            baseline.clone(),
             taken_at_ns.clone(),
+            output_pts.clone(),
             first_pts.clone(),
         );
         // A per-buffer probe, which this codebase treats as performance
-        // critical: a few atomic loads and compares per buffer, installed for
-        // a single take and removed once the cut is placed.
+        // critical: a few atomic loads, stores and compares per buffer,
+        // installed for a single take and removed once the cut is placed. It
+        // watches the block's output, so it sees the timestamps the mixer
+        // composites by. cefsrc stamps frames with running time when it makes
+        // them, whichever gstcefsrc build it is.
         //
-        // It watches the block's output, so it sees the timestamps the mixer
-        // composites by; these need not be pipeline running time, since some
-        // gstcefsrc builds stamp frames from a counter. The first buffer only
-        // sets the baseline. After the take, only new content counts: a repeat
-        // of the page's last frame, whether livesync's (flagged GAP) or a
-        // cefsrc that re-sends its current frame, shares that frame's memory,
-        // and a fresh paint is a new allocation.
+        // The first buffer only sets the baseline. After the take, only new
+        // content counts: a repeat of the page's last frame, whether
+        // livesync's (flagged GAP) or a cefsrc that re-sends its current frame,
+        // shares that frame's memory, and a fresh paint is a new allocation.
         let probe = pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
             let Some(buffer) = info.buffer() else {
                 return gst::PadProbeReturn::Ok;
@@ -97,30 +108,35 @@ impl WebAnchor {
             let Some(pts) = buffer.pts().map(|t| t.nseconds()) else {
                 return gst::PadProbeReturn::Ok;
             };
-            if p_seen_pts.load(Ordering::Relaxed) == u64::MAX {
-                p_seen_at.store(created.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                p_seen_pts.store(pts, Ordering::Relaxed);
+            if !p_baseline.swap(true, Ordering::Relaxed) {
                 return gst::PadProbeReturn::Ok;
             }
-            if p_taken.load(Ordering::Relaxed) == u64::MAX
-                || buffer.flags().contains(gst::BufferFlags::GAP)
-                || memory == previous
+            let taken_at = p_taken.load(Ordering::Relaxed);
+            if taken_at == u64::MAX {
+                return gst::PadProbeReturn::Ok;
+            }
+            p_output.store(pts, Ordering::Relaxed);
+            if pts >= taken_at
+                && memory != previous
+                && !buffer.flags().contains(gst::BufferFlags::GAP)
             {
-                return gst::PadProbeReturn::Ok;
+                let _ =
+                    p_first.compare_exchange(u64::MAX, pts, Ordering::Relaxed, Ordering::Relaxed);
             }
-            let _ = p_first.compare_exchange(u64::MAX, pts, Ordering::Relaxed, Ordering::Relaxed);
             gst::PadProbeReturn::Ok
         })?;
         Some(Self {
             source: source.to_string(),
             pad: pad.downgrade(),
             probe: std::sync::Mutex::new(Some(probe)),
-            created,
-            seen_pts,
-            seen_at_ns,
+            clock,
+            base_time,
+            baseline,
             taken_at_ns,
+            output_pts,
             first_pts,
             reported: std::sync::atomic::AtomicBool::new(false),
+            delay: PAGE_FIRST_FRAME_DELAY_PAINTED,
         })
     }
 
@@ -129,49 +145,37 @@ impl WebAnchor {
     /// falls silent, so this is at most about a frame.
     async fn ready(&self, limit: std::time::Duration) {
         let until = std::time::Instant::now() + limit;
-        while self.seen_pts.load(Ordering::Relaxed) == u64::MAX && std::time::Instant::now() < until
-        {
+        while !self.baseline.load(Ordering::Relaxed) && std::time::Instant::now() < until {
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
     }
 
     /// Record that the take has just changed the page's URL.
     fn taken(&self) {
-        self.taken_at_ns
-            .store(self.created.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let now = self.clock.time().saturating_sub(self.base_time).nseconds();
+        self.taken_at_ns.store(now, Ordering::Relaxed);
     }
 
-    /// Output timestamp at which the page's animation started, once known.
-    fn offset_ns(&self) -> Option<i64> {
+    /// Running time at which the page's animation started, once known.
+    fn offset_ns(&self) -> Option<(i64, bool)> {
         use crate::gst::stinger::{web_stinger_start, WebStart};
-        let taken_at = self.taken_at_ns.load(Ordering::Relaxed);
-        if taken_at == u64::MAX {
-            return None;
-        }
-        let taken_pts = match self.seen_pts.load(Ordering::Relaxed) {
+        let load = |a: &AtomicU64| match a.load(Ordering::Relaxed) {
             u64::MAX => None,
-            seen_pts => {
-                let seen_at = self.seen_at_ns.load(Ordering::Relaxed);
-                let pts = seen_pts as i128 + taken_at as i128 - seen_at as i128;
-                Some(pts.max(0) as u64)
-            }
+            v => Some(v),
         };
-        let first = match self.first_pts.load(Ordering::Relaxed) {
-            u64::MAX => None,
-            pts => Some(pts),
-        };
-        let elapsed = (self.created.elapsed().as_nanos() as u64).saturating_sub(taken_at);
+        let taken_at = load(&self.taken_at_ns)?;
+        let first = load(&self.first_pts);
         let start = web_stinger_start(
             first,
-            taken_pts,
-            elapsed,
+            taken_at,
+            load(&self.output_pts),
             PAGE_FIRST_FRAME_GRACE.as_nanos() as u64,
-            PAGE_FIRST_FRAME_DELAY.as_nanos() as u64,
+            self.delay.as_nanos() as u64,
         );
         let report = !self
             .reported
             .swap(!matches!(start, WebStart::Waiting), Ordering::Relaxed);
-        let after_take = |ns: u64| ns.saturating_sub(taken_pts.unwrap_or(0)) / 1_000_000;
+        let after_take = |ns: u64| ns.saturating_sub(taken_at) / 1_000_000;
         match start {
             WebStart::Waiting => None,
             WebStart::FirstFrame(ns) => {
@@ -182,7 +186,7 @@ impl WebAnchor {
                         after_take(ns)
                     );
                 }
-                i64::try_from(ns).ok()
+                i64::try_from(ns).ok().map(|o| (o, true))
             }
             WebStart::FromTake(ns) => {
                 if report {
@@ -197,7 +201,7 @@ impl WebAnchor {
                             .unwrap_or_default()
                     );
                 }
-                i64::try_from(ns).ok()
+                i64::try_from(ns).ok().map(|o| (o, false))
             }
         }
     }
@@ -218,9 +222,11 @@ impl Drop for WebAnchor {
 }
 
 impl Anchor {
-    fn offset_ns(&self) -> Option<i64> {
+    /// Where the overlay's time zero sits, and whether it is a page frame's
+    /// timestamp, which still has to be snapped to an output frame.
+    fn offset_ns(&self) -> Option<(i64, bool)> {
         match self {
-            Anchor::Clip(player) => player.stream_offset_ns(),
+            Anchor::Clip(player) => player.stream_offset_ns().map(|o| (o, false)),
             Anchor::Web(web) => web.offset_ns(),
         }
     }
@@ -234,6 +240,8 @@ enum Overlay {
     Web {
         cefsrc: gst::Element,
         output: gst::Pad,
+        clock: gst::Clock,
+        base_time: gst::ClockTime,
         /// Page URL without a fragment; the take owns the fragment.
         base_url: String,
     },
@@ -356,10 +364,12 @@ impl AppState {
                         let output = m
                             .block_element(&binding.source_block_id, html_graphic::OUTPUT_ELEMENT)?
                             .static_pad("src")?;
-                        Some((cefsrc, output))
+                        let clock = m.pipeline().clock()?;
+                        let base_time = m.pipeline().base_time()?;
+                        Some((cefsrc, output, clock, base_time))
                     })
                 };
-                let Some((cefsrc, output)) = elements else {
+                let Some((cefsrc, output, clock, base_time)) = elements else {
                     return self
                         .cut_without_the_overlay(
                             flow_id,
@@ -380,6 +390,8 @@ impl AppState {
                     Overlay::Web {
                         cefsrc,
                         output,
+                        clock,
+                        base_time,
                         base_url,
                     },
                     duration_ms,
@@ -453,9 +465,16 @@ impl AppState {
             Overlay::Web {
                 cefsrc,
                 output,
+                clock,
+                base_time,
                 base_url,
-            } => match WebAnchor::watch(&binding.source_block_id, output) {
-                Some(anchor) => {
+            } => match WebAnchor::watch(&binding.source_block_id, output, clock, base_time) {
+                Some(mut anchor) => {
+                    // gstcefsrc with this property emits frames as Chromium
+                    // paints; without it, it re-sends frames at a fixed rate.
+                    if cefsrc.find_property("max-video-framerate").is_none() {
+                        anchor.delay = PAGE_FIRST_FRAME_DELAY_FIXED_RATE;
+                    }
                     anchor.ready(std::time::Duration::from_millis(100)).await;
                     // A new fragment is a same-document navigation: the loaded
                     // page gets hashchange and starts its animation, rather than
@@ -702,7 +721,7 @@ impl AppState {
             played_at + std::time::Duration::from_millis(cut_point_ms) + Self::STINGER_ANCHOR_GRACE;
 
         // The offset is only known once the overlay's first frame has arrived.
-        let offset = loop {
+        let (offset, page_start) = loop {
             if let Some(o) = anchor.offset_ns() {
                 break o;
             }
@@ -724,6 +743,13 @@ impl AppState {
                 manager.mixer_frame_duration_ns(block_instance_id)?,
                 manager.mixer_src_pad(block_instance_id)?,
             )
+        };
+        // Snap a page's first frame to an output frame; see
+        // `web_first_output_frame`. An estimate from the take is not a frame.
+        let offset = if page_start && offset >= 0 {
+            crate::gst::stinger::web_first_output_frame(offset as u64, frame_ns) as i64
+        } else {
+            offset
         };
 
         // Floor, not round: the frame that carries the cut point is the one
