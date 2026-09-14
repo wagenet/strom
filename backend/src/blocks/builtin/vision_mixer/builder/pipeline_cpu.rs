@@ -177,10 +177,9 @@ pub(super) fn build_cpu_pipeline(
             }
             let vc_pre_id = p.id(&format!("videoconvert_unpremultiply_dsk_{}", i));
             let unpre_id = p.id(&format!("unpremultiply_dsk_{}", i));
-            elems.push((
-                vc_pre_id.clone(),
-                elements::make_element(vc_factory, &vc_pre_id)?,
-            ));
+            let videoconvert_pre = elements::make_element(vc_factory, &vc_pre_id)?;
+            gpu::configure_video_convert(&videoconvert_pre);
+            elems.push((vc_pre_id.clone(), videoconvert_pre));
             elems.push((
                 unpre_id.clone(),
                 elements::make_element(unpremultiply::ELEMENT_NAME, &unpre_id)?,
