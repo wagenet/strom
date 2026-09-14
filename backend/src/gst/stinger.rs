@@ -326,29 +326,41 @@ pub enum WebStart {
 /// screen straight away. One that opens on invisible frames (an element moving
 /// in from off frame, a fade from nothing, a delayed start) delivers its first
 /// frame late, and anchoring on it would cut late by the same amount. Its own
-/// clock started at `hashchange`, so a frame more than `grace_ns` after the take
-/// is ignored in favour of the take plus the usual delivery delay.
+/// clock started at `hashchange`, so a frame stamped more than `grace_ns` after
+/// the take is ignored in favour of the take plus the usual delivery delay.
 ///
-/// Times are in the source's output timestamps, which is the timeline the
-/// mixer composites by; a gstcefsrc build may stamp frames from a counter rather
-/// than the pipeline clock. `taken_at_ns` is the take in that timeline, unknown
-/// until the source has delivered a buffer after it. `elapsed_ns` is wall time
-/// since the take, which decides when to stop waiting.
+/// All times are running times in nanoseconds. `first_frame_ns` is the first
+/// frame of new content stamped at or after `taken_at_ns`. `output_ns` is the
+/// newest timestamp seen on the output, repeats included: the grace period ends
+/// when the output has moved past it, not when wall time has, because frames
+/// can be held for a while between being painted and reaching the output.
 pub fn web_stinger_start(
     first_frame_ns: Option<u64>,
-    taken_at_ns: Option<u64>,
-    elapsed_ns: u64,
+    taken_at_ns: u64,
+    output_ns: Option<u64>,
     grace_ns: u64,
     delay_ns: u64,
 ) -> WebStart {
-    let Some(taken_at) = taken_at_ns else {
-        return WebStart::Waiting;
-    };
+    let deadline = taken_at_ns.saturating_add(grace_ns);
     match first_frame_ns {
-        Some(frame) if frame <= taken_at.saturating_add(grace_ns) => WebStart::FirstFrame(frame),
-        _ if elapsed_ns > grace_ns => WebStart::FromTake(taken_at.saturating_add(delay_ns)),
+        Some(frame) if frame <= deadline => WebStart::FirstFrame(frame),
+        _ if output_ns.is_some_and(|out| out > deadline) => {
+            WebStart::FromTake(taken_at_ns.saturating_add(delay_ns))
+        }
         _ => WebStart::Waiting,
     }
+}
+
+/// The output frame a web stinger's first frame is taken to start on: the one
+/// whose start is nearest its timestamp.
+///
+/// Which output frame first composites a page frame depends on when it reaches
+/// the mixer, which varies with how its paint falls against livesync's slots
+/// and the mixer's frames. Anchoring on the frame containing the timestamp cut
+/// about a frame early on average and on the next frame about a frame late;
+/// the nearest keeps the error within half a frame either way.
+pub fn web_first_output_frame(first_frame_ns: u64, frame_ns: u64) -> u64 {
+    (first_frame_ns + frame_ns / 2) / frame_ns * frame_ns
 }
 
 /// Keyed inputs a block feeds, as `(mixer block id, keyed input index)`.
@@ -836,31 +848,42 @@ mod tests {
     fn a_prompt_first_frame_marks_the_start() {
         assert_eq!(
             web_stinger_start(
-                Some(1_020 * MS),
-                Some(1_000 * MS),
-                30 * MS,
-                70 * MS,
-                20 * MS
+                Some(1_060 * MS),
+                1_000 * MS,
+                Some(1_060 * MS),
+                100 * MS,
+                45 * MS
             ),
-            WebStart::FirstFrame(1_020 * MS)
+            WebStart::FirstFrame(1_060 * MS)
         );
     }
 
     #[test]
     fn no_frame_yet_within_the_grace_period_keeps_waiting() {
         assert_eq!(
-            web_stinger_start(None, Some(1_000 * MS), 50 * MS, 70 * MS, 20 * MS),
+            web_stinger_start(None, 1_000 * MS, Some(1_090 * MS), 100 * MS, 45 * MS),
             WebStart::Waiting
         );
     }
 
-    /// Until the source has delivered a buffer, the take cannot be placed in its
-    /// timeline, however long it has been.
+    /// A frame painted inside the grace period but held on its way to the
+    /// output still counts once it arrives: the wait is over only when the
+    /// output has moved past the grace period, however long that takes.
     #[test]
-    fn an_unplaced_take_keeps_waiting() {
+    fn waiting_ends_by_output_timestamps_not_wall_time() {
         assert_eq!(
-            web_stinger_start(None, None, 500 * MS, 70 * MS, 20 * MS),
+            web_stinger_start(None, 1_000 * MS, None, 100 * MS, 45 * MS),
             WebStart::Waiting
+        );
+        assert_eq!(
+            web_stinger_start(
+                Some(1_063 * MS),
+                1_000 * MS,
+                Some(1_063 * MS),
+                100 * MS,
+                45 * MS
+            ),
+            WebStart::FirstFrame(1_063 * MS)
         );
     }
 
@@ -871,20 +894,38 @@ mod tests {
         assert_eq!(
             web_stinger_start(
                 Some(1_300 * MS),
-                Some(1_000 * MS),
-                310 * MS,
-                70 * MS,
-                20 * MS
+                1_000 * MS,
+                Some(1_300 * MS),
+                100 * MS,
+                45 * MS
             ),
-            WebStart::FromTake(1_020 * MS)
+            WebStart::FromTake(1_045 * MS)
         );
     }
 
     #[test]
-    fn no_frame_past_the_grace_period_falls_back_to_the_take_time() {
+    fn no_frame_once_the_output_passes_the_grace_period_falls_back_to_the_take() {
         assert_eq!(
-            web_stinger_start(None, Some(1_000 * MS), 71 * MS, 70 * MS, 20 * MS),
-            WebStart::FromTake(1_020 * MS)
+            web_stinger_start(None, 1_000 * MS, Some(1_101 * MS), 100 * MS, 45 * MS),
+            WebStart::FromTake(1_045 * MS)
+        );
+    }
+
+    const FRAME: u64 = 33_333_333;
+
+    #[test]
+    fn a_page_frame_late_in_an_output_frame_is_taken_to_start_on_the_next() {
+        assert_eq!(
+            web_first_output_frame(29 * FRAME + 20 * MS, FRAME),
+            30 * FRAME
+        );
+    }
+
+    #[test]
+    fn a_page_frame_early_in_an_output_frame_is_taken_to_start_on_it() {
+        assert_eq!(
+            web_first_output_frame(29 * FRAME + 10 * MS, FRAME),
+            29 * FRAME
         );
     }
 
