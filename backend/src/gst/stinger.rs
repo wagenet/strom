@@ -326,22 +326,27 @@ pub enum WebStart {
 /// screen straight away. One that opens on invisible frames (an element moving
 /// in from off frame, a fade from nothing, a delayed start) delivers its first
 /// frame late, and anchoring on it would cut late by the same amount. Its own
-/// clock started at `hashchange`, so a frame later than `grace_ns` after the
-/// take is ignored in favour of the take time plus the usual delivery delay.
+/// clock started at `hashchange`, so a frame more than `grace_ns` after the take
+/// is ignored in favour of the take plus the usual delivery delay.
 ///
-/// All times are running times in nanoseconds. `first_frame_ns` only counts
-/// frames timestamped at or after `taken_at_ns`.
+/// Times are in the source's output timestamps, which is the timeline the
+/// mixer composites by; a gstcefsrc build may stamp frames from a counter rather
+/// than the pipeline clock. `taken_at_ns` is the take in that timeline, unknown
+/// until the source has delivered a buffer after it. `elapsed_ns` is wall time
+/// since the take, which decides when to stop waiting.
 pub fn web_stinger_start(
     first_frame_ns: Option<u64>,
-    taken_at_ns: u64,
-    now_ns: u64,
+    taken_at_ns: Option<u64>,
+    elapsed_ns: u64,
     grace_ns: u64,
     delay_ns: u64,
 ) -> WebStart {
-    let deadline = taken_at_ns.saturating_add(grace_ns);
+    let Some(taken_at) = taken_at_ns else {
+        return WebStart::Waiting;
+    };
     match first_frame_ns {
-        Some(frame) if frame <= deadline => WebStart::FirstFrame(frame),
-        _ if now_ns > deadline => WebStart::FromTake(taken_at_ns.saturating_add(delay_ns)),
+        Some(frame) if frame <= taken_at.saturating_add(grace_ns) => WebStart::FirstFrame(frame),
+        _ if elapsed_ns > grace_ns => WebStart::FromTake(taken_at.saturating_add(delay_ns)),
         _ => WebStart::Waiting,
     }
 }
@@ -830,7 +835,13 @@ mod tests {
     #[test]
     fn a_prompt_first_frame_marks_the_start() {
         assert_eq!(
-            web_stinger_start(Some(1_020 * MS), 1_000 * MS, 1_030 * MS, 70 * MS, 20 * MS),
+            web_stinger_start(
+                Some(1_020 * MS),
+                Some(1_000 * MS),
+                30 * MS,
+                70 * MS,
+                20 * MS
+            ),
             WebStart::FirstFrame(1_020 * MS)
         );
     }
@@ -838,7 +849,17 @@ mod tests {
     #[test]
     fn no_frame_yet_within_the_grace_period_keeps_waiting() {
         assert_eq!(
-            web_stinger_start(None, 1_000 * MS, 1_050 * MS, 70 * MS, 20 * MS),
+            web_stinger_start(None, Some(1_000 * MS), 50 * MS, 70 * MS, 20 * MS),
+            WebStart::Waiting
+        );
+    }
+
+    /// Until the source has delivered a buffer, the take cannot be placed in its
+    /// timeline, however long it has been.
+    #[test]
+    fn an_unplaced_take_keeps_waiting() {
+        assert_eq!(
+            web_stinger_start(None, None, 500 * MS, 70 * MS, 20 * MS),
             WebStart::Waiting
         );
     }
@@ -848,7 +869,13 @@ mod tests {
     #[test]
     fn a_late_first_frame_is_replaced_by_the_take_time() {
         assert_eq!(
-            web_stinger_start(Some(1_300 * MS), 1_000 * MS, 1_310 * MS, 70 * MS, 20 * MS),
+            web_stinger_start(
+                Some(1_300 * MS),
+                Some(1_000 * MS),
+                310 * MS,
+                70 * MS,
+                20 * MS
+            ),
             WebStart::FromTake(1_020 * MS)
         );
     }
@@ -856,7 +883,7 @@ mod tests {
     #[test]
     fn no_frame_past_the_grace_period_falls_back_to_the_take_time() {
         assert_eq!(
-            web_stinger_start(None, 1_000 * MS, 1_071 * MS, 70 * MS, 20 * MS),
+            web_stinger_start(None, Some(1_000 * MS), 71 * MS, 70 * MS, 20 * MS),
             WebStart::FromTake(1_020 * MS)
         );
     }

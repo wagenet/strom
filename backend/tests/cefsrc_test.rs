@@ -806,7 +806,12 @@ async fn start_html_stinger_flow(
     }
 
     // The HTML Graphic block uses livesync, which Strom links statically.
-    let _ = gstlivesync::plugin_register_static();
+    // Register it once per process: registering a static plugin again replaces
+    // its element factory under elements that still point at the old one.
+    static LIVESYNC: std::sync::Once = std::sync::Once::new();
+    LIVESYNC.call_once(|| {
+        gstlivesync::plugin_register_static().expect("register livesync");
+    });
 
     let mut flow = Flow::new(name);
     for (id, colour) in [("red", "0xffff0000"), ("green", "0xff00ff00")] {
