@@ -485,6 +485,7 @@ fn run_with_gui(
         gstwebrtchttp::plugin_register_static().expect("Could not register webrtchttp plugins");
         gstrswebrtc::plugin_register_static().expect("Could not register webrtc plugins");
         gstrsinter::plugin_register_static().expect("Could not register inter plugins");
+        gstlivesync::plugin_register_static().expect("Could not register livesync plugin");
         gstrsrtp::plugin_register_static().expect("Could not register rtp plugins");
         gstrsaudiofx::plugin_register_static().expect("Could not register audiofx plugins");
         gst_plugins_lsp::plugin_register_static().expect("Could not register lsp-dsp-rs plugins");
@@ -712,6 +713,7 @@ async fn run_headless(
     gstwebrtchttp::plugin_register_static().expect("Could not register webrtchttp plugins");
     gstrswebrtc::plugin_register_static().expect("Could not register webrtc plugins");
     gstrsinter::plugin_register_static().expect("Could not register inter plugins");
+    gstlivesync::plugin_register_static().expect("Could not register livesync plugin");
     gstrsrtp::plugin_register_static().expect("Could not register rtp plugins");
     gstrsaudiofx::plugin_register_static().expect("Could not register audiofx plugins");
     gst_plugins_lsp::plugin_register_static().expect("Could not register lsp-dsp-rs plugins");

@@ -1,10 +1,11 @@
 //! HTML graphic block: a web page rendered by `cefsrc` as a keyed overlay.
 //!
-//! Chain: `cefsrc -> capsfilter`. `cefsrc` has no width or height properties and
-//! renders at whatever size is negotiated, so the capsfilter sets it. Its caps
-//! carry a variable frame rate (`framerate=0/1`); `max-video-framerate` caps how
-//! often Chromium paints, and nothing downstream may pin a fixed rate or
-//! negotiation fails.
+//! Chain: `cefsrc -> capsfilter -> livesync`. `cefsrc` has no width or height
+//! properties and renders at whatever size is negotiated, so the capsfilter sets
+//! it. Recent gstcefsrc advertises a variable frame rate (`framerate=0/1`) and
+//! emits a frame only when Chromium paints; `max-video-framerate` caps how often
+//! that is, and nothing downstream may pin a fixed rate or negotiation fails.
+//! `livesync` repeats the last frame while the page is idle.
 //!
 //! Chromium paints premultiplied alpha, so a keyed input fed by this block must
 //! be declared premultiplied. As a stinger source, a take changes the page's URL
@@ -27,7 +28,7 @@ pub const DEFAULT_FRAMERATE: &str = "30/1";
 /// Element id suffix of the block's `cefsrc`.
 pub const CEFSRC_ELEMENT: &str = "cefsrc";
 /// Element id suffix of the element whose src pad is the block's output.
-pub const OUTPUT_ELEMENT: &str = "capsfilter";
+pub const OUTPUT_ELEMENT: &str = "livesync";
 
 /// HTML graphic block builder.
 pub struct HtmlGraphicBuilder;
@@ -79,7 +80,8 @@ impl BlockBuilder for HtmlGraphicBuilder {
         );
 
         let cefsrc_id = format!("{instance_id}:{CEFSRC_ELEMENT}");
-        let caps_id = format!("{instance_id}:{OUTPUT_ELEMENT}");
+        let caps_id = format!("{instance_id}:capsfilter");
+        let livesync_id = format!("{instance_id}:{OUTPUT_ELEMENT}");
 
         let cefsrc = gst::ElementFactory::make("cefsrc")
             .name(&cefsrc_id)
@@ -98,6 +100,28 @@ impl BlockBuilder for HtmlGraphicBuilder {
         })?;
         cefsrc.set_property("max-video-framerate", gst::Fraction::new(numer, denom));
 
+        // livesync repeats the last frame while the page is idle, so its keyed
+        // input never falls silent: a live mixer waits out its latency on an
+        // input that stops, which freezes program output for that long. It
+        // times repeats by buffer duration, which cefsrc leaves unset, so fill
+        // it in. Timestamps are left alone: a stinger's cut is anchored on them.
+        let frame_ns = gst::ClockTime::SECOND.nseconds() * denom as u64 / numer as u64;
+        if let Some(src) = cefsrc.static_pad("src") {
+            // A per-buffer probe, which this codebase treats as performance
+            // critical: one check and a metadata write on a buffer cefsrc has
+            // just handed over, so making it writable does not copy.
+            src.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+                if let Some(buffer) = info.buffer_mut() {
+                    if buffer.duration().is_none() {
+                        if let Some(b) = buffer.get_mut() {
+                            b.set_duration(gst::ClockTime::from_nseconds(frame_ns));
+                        }
+                    }
+                }
+                gst::PadProbeReturn::Ok
+            });
+        }
+
         let caps = gst::Caps::builder("video/x-raw")
             .field("width", width)
             .field("height", height)
@@ -108,12 +132,30 @@ impl BlockBuilder for HtmlGraphicBuilder {
             .build()
             .map_err(|e| BlockBuildError::ElementCreation(format!("capsfilter: {e}")))?;
 
+        // No added latency: waiting before repeating lets a slightly late
+        // frame keep its slot, but every frame of waiting lengthens the stall
+        // the mixer sees when the page goes quiet.
+        let livesync = gst::ElementFactory::make("livesync")
+            .name(&livesync_id)
+            .build()
+            .map_err(|e| BlockBuildError::ElementCreation(format!("livesync: {e}")))?;
+
         Ok(BlockBuildResult {
-            elements: vec![(cefsrc_id.clone(), cefsrc), (caps_id.clone(), capsfilter)],
-            internal_links: vec![(
-                element::ElementPadRef::pad(&cefsrc_id, "src"),
-                element::ElementPadRef::pad(&caps_id, "sink"),
-            )],
+            elements: vec![
+                (cefsrc_id.clone(), cefsrc),
+                (caps_id.clone(), capsfilter),
+                (livesync_id.clone(), livesync),
+            ],
+            internal_links: vec![
+                (
+                    element::ElementPadRef::pad(&cefsrc_id, "src"),
+                    element::ElementPadRef::pad(&caps_id, "sink"),
+                ),
+                (
+                    element::ElementPadRef::pad(&caps_id, "src"),
+                    element::ElementPadRef::pad(&livesync_id, "sink"),
+                ),
+            ],
             bus_message_handler: None,
             pad_properties: HashMap::new(),
         })

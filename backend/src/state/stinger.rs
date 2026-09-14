@@ -66,12 +66,31 @@ impl WebAnchor {
         let first_pts = Arc::new(AtomicU64::new(u64::MAX));
         let seen = first_pts.clone();
         // A per-buffer probe, which this codebase treats as performance
-        // critical: one compare and at most one compare-and-set per buffer,
-        // installed for a single take and removed once the cut is placed.
-        // Frames stamped before the take do not count. cefsrc's segment starts
-        // at zero, so its timestamps are running times.
+        // critical: a flag test, two pointer compares and at most one
+        // compare-and-set per buffer, installed for a single take and removed
+        // once the cut is placed. It watches the block's output, so it sees the
+        // timestamps the mixer sees.
+        //
+        // Only new content counts. A repeat of the page's last frame, whether
+        // livesync's (flagged GAP) or a cefsrc that re-sends its current frame,
+        // shares that frame's memory; a fresh paint is a new allocation. Frames
+        // stamped before the take do not count either. The segment starts at
+        // zero, so timestamps are running times.
+        let last_memory = std::sync::atomic::AtomicUsize::new(0);
         let probe = pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
-            if let Some(pts) = info.buffer().and_then(|b| b.pts()) {
+            let Some(buffer) = info.buffer() else {
+                return gst::PadProbeReturn::Ok;
+            };
+            let memory = if buffer.n_memory() > 0 {
+                buffer.peek_memory(0).as_ptr() as usize
+            } else {
+                0
+            };
+            let previous = last_memory.swap(memory, Ordering::Relaxed);
+            if buffer.flags().contains(gst::BufferFlags::GAP) || memory == previous {
+                return gst::PadProbeReturn::Ok;
+            }
+            if let Some(pts) = buffer.pts() {
                 if pts.nseconds() >= taken_at_ns {
                     let _ = seen.compare_exchange(
                         u64::MAX,
