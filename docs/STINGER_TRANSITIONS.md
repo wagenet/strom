@@ -55,8 +55,7 @@ duration is shortened so the transition finishes while the graphic is still cove
 are told both the duration declared and the one that was applied.
 
 For a clip, the cut lands on the frame that carries the cut point, on both mixer backends.
-A page does the same when its animation changes something visible on its first frame; see
-[Timing a page](#timing-a-page).
+For a page it lands within a frame of it; see [Timing a page](#timing-a-page).
 
 ## Firing one
 
@@ -120,15 +119,16 @@ page. The page has to cooperate:
 
 The cut point is measured from the start of the page's animation, and Strom finds that
 start by watching for the first frame the page delivers after the take. Chromium only
-delivers a frame when something on screen changes, so that works exactly when the animation
-changes something visible straight away — any technique will do: CSS animations and
-transitions, `requestAnimationFrame` moving elements, canvas or SVG.
+delivers a frame when something on screen changes, so that works when the animation changes
+something visible straight away — any technique will do: CSS animations and transitions,
+`requestAnimationFrame` moving elements, canvas or SVG. The cut then lands within a frame of
+the cut point, and usually exactly on it.
 
 A page whose animation begins invisibly delivers its first frame late: an element sliding
 in from fully off the frame, a fade up from nothing, an animation with a start delay. Some
 CSS animations also do this on the first take after the page loads, and not on later ones.
 When no frame arrives within a few frames of the take, Strom times the cut from the take
-itself instead. That keeps the cut within about a frame of the cut point, and logs a
+itself instead. That also keeps the cut within about a frame of the cut point, and logs a
 warning naming the graphic:
 
 ```
@@ -136,8 +136,7 @@ HTML graphic stinger_page: no frame within 70 ms of the take, so the cut is time
 take and may be a frame out. A stinger page should change something visible on its first frame
 ```
 
-For a cut that lands exactly on its frame every time, start the animation with something
-already on screen — the leading edge of a wipe, a first visible step of a fade. A 1-pixel
+For the most consistent timing, start the animation with something already on screen — the leading edge of a wipe, a first visible step of a fade. A 1-pixel
 element that changes on every animation frame also works for a design that has to open on
 an empty frame; drawing on a canvas counts too, even when what is drawn is transparent.
 
