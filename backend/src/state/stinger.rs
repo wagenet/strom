@@ -38,11 +38,15 @@ enum Anchor {
 /// start of its animation, and the delivery delay assumed when it is not. See
 /// `gst::stinger::web_stinger_start`.
 const PAGE_FIRST_FRAME_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
-/// Measured from a take to a prompt page's first frame: ~17 ms on gstcefsrc
-/// that emits frames as Chromium paints, ~61 ms on older builds that re-send
-/// their current frame at a fixed rate and pick up a paint only on the next.
+/// Delay from a take to when a page's animation starts, used when the page
+/// paints nothing prompt to time from. Set from where late-painting pages cut
+/// by their own clock: about 20 ms on gstcefsrc that emits frames as Chromium
+/// paints. Older builds that re-send their current frame at a fixed rate pick
+/// up a paint only on the next frame and need about 130 ms on Linux, where
+/// production runs (about 75 ms on macOS).
 const PAGE_FIRST_FRAME_DELAY_PAINTED: std::time::Duration = std::time::Duration::from_millis(20);
-const PAGE_FIRST_FRAME_DELAY_FIXED_RATE: std::time::Duration = std::time::Duration::from_millis(60);
+const PAGE_FIRST_FRAME_DELAY_FIXED_RATE: std::time::Duration =
+    std::time::Duration::from_millis(120);
 
 struct WebAnchor {
     source: String,
