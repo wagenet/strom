@@ -98,7 +98,13 @@ impl BlockBuilder for HtmlGraphicBuilder {
                 "HTML graphic framerate '{framerate}' is not a fraction like 30/1"
             ))
         })?;
-        cefsrc.set_property("max-video-framerate", gst::Fraction::new(numer, denom));
+        // Recent gstcefsrc caps its paint rate with a property and negotiates
+        // only a variable rate; older builds, such as the one the strom-full
+        // image pins, have no such property and negotiate a fixed rate instead.
+        let variable_rate = cefsrc.find_property("max-video-framerate").is_some();
+        if variable_rate {
+            cefsrc.set_property("max-video-framerate", gst::Fraction::new(numer, denom));
+        }
 
         // livesync repeats the last frame while the page is idle, so its keyed
         // input never falls silent: a live mixer waits out its latency on an
@@ -122,10 +128,14 @@ impl BlockBuilder for HtmlGraphicBuilder {
             });
         }
 
-        let caps = gst::Caps::builder("video/x-raw")
+        let mut caps = gst::Caps::builder("video/x-raw")
             .field("width", width)
             .field("height", height)
             .build();
+        if !variable_rate {
+            caps.make_mut()
+                .set("framerate", gst::Fraction::new(numer, denom));
+        }
         let capsfilter = gst::ElementFactory::make("capsfilter")
             .name(&caps_id)
             .property("caps", &caps)
