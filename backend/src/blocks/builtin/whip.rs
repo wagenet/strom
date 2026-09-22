@@ -19,7 +19,7 @@ use crate::gst::ice_preflight;
 use crate::gst::keyframe_request;
 use crate::gst::rtp_hdrext;
 use crate::whip_session_manager::{
-    ActivityStamp, SessionActivity, SessionCleanupRequest, WhipEndpointConfig,
+    ActivityStamp, SessionActivity, SessionCleanupRequest, StallSide, WhipEndpointConfig,
 };
 use gstreamer as gst;
 use gstreamer::prelude::*;
@@ -713,8 +713,9 @@ fn wait_until_deadline_or_stop(stop: &AtomicBool, deadline: Instant) -> bool {
 /// Block until the session has gone `timeout` without producing usable media, or
 /// until `stop` is set.
 ///
-/// Returns `Some(idle_ms)` once the idle time crosses `timeout`, or `None` if a
-/// teardown path set `stop` first.
+/// Returns `Some((idle_ms, side))` once the idle time crosses `timeout`, or
+/// `None` if a teardown path set `stop` first. `side` names which stamp froze,
+/// so the reap log can point at the publisher or at the flow's own consumers.
 ///
 /// Idle comes from `SessionActivity::idle`, so this reaps both a publisher that
 /// went away and a seat that keeps receiving RTP while nothing comes out of its
@@ -730,16 +731,16 @@ fn wait_for_inactivity(
     stop: &AtomicBool,
     activity: &SessionActivity,
     timeout: std::time::Duration,
-) -> Option<u64> {
+) -> Option<(u64, StallSide)> {
     loop {
         if wait_until_deadline_or_stop(stop, Instant::now() + WATCHDOG_POLL) {
             return None;
         }
-        let Some(idle) = activity.idle() else {
+        let Some((idle, side)) = activity.idle_detail() else {
             continue;
         };
         if idle >= timeout {
-            return Some(idle.as_millis() as u64);
+            return Some((idle.as_millis() as u64, side));
         }
     }
 }
@@ -1016,7 +1017,7 @@ pub fn create_whipserversrc_for_session(
             .spawn(move || {
                 // Returns None when another path (ICE callback, DELETE, flow stop)
                 // finished with this session first.
-                let Some(idle_ms) = wait_for_inactivity(
+                let Some((idle_ms, side)) = wait_for_inactivity(
                     &cleanup_sent_watchdog,
                     &activity_watchdog,
                     INACTIVITY_TIMEOUT,
@@ -1025,12 +1026,12 @@ pub fn create_whipserversrc_for_session(
                 };
                 if !cleanup_sent_watchdog.swap(true, Ordering::SeqCst) {
                     info!(
-                        "WHIP Input: Inactivity timeout ({}ms without usable media) on port {}, triggering cleanup",
-                        idle_ms, port
+                        "WHIP Input: Inactivity timeout ({}ms without usable media: {}) on port {}, triggering cleanup",
+                        idle_ms, side, port
                     );
                     let _ = cleanup_tx_watchdog.send(SessionCleanupRequest {
                         port,
-                        reason: format!("inactivity ({}ms without usable media)", idle_ms),
+                        reason: format!("inactivity ({}ms without usable media: {})", idle_ms, side),
                     });
                 }
             })
@@ -2260,9 +2261,16 @@ mod tests {
         });
 
         let started = Instant::now();
-        let idle_ms = wait_for_inactivity(&stop, &activity, timeout)
+        let (idle_ms, side) = wait_for_inactivity(&stop, &activity, timeout)
             .expect("watchdog must report inactivity, not a stop");
         let detection = started.elapsed();
+
+        // Both stamps froze together, which is a publisher that went away.
+        assert_eq!(
+            side,
+            StallSide::Ingress,
+            "a session whose arrivals stopped must be reported against the publisher"
+        );
 
         // Slack over the expected 1250 ms covers scheduler jitter but stays well
         // clear of the 2000 ms the once-per-timeout evaluation would take.
@@ -2350,9 +2358,9 @@ mod tests {
         publisher_stop.store(true, Ordering::SeqCst);
 
         assert!(
-            matches!(reaped, Ok(Some(ms)) if ms >= INACTIVITY_TIMEOUT.as_millis() as u64),
-            "a seat receiving RTP it never decodes must be reaped, not held \
-             alive by its arriving-bytes counter: {:?}",
+            matches!(reaped, Ok(Some((ms, StallSide::Output))) if ms >= INACTIVITY_TIMEOUT.as_millis() as u64),
+            "a seat receiving RTP it never decodes must be reaped against the \
+             slot's output, not held alive by its arriving-bytes counter: {:?}",
             reaped
         );
     }
