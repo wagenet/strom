@@ -69,6 +69,7 @@ fn init_gst() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         gstreamer::init().expect("gst init");
+        strom::gpu::detect_gpu_capabilities();
         gstwebrtchttp::plugin_register_static().expect("register webrtchttp plugins");
         gstrswebrtc::plugin_register_static().expect("register webrtc plugins");
     });
