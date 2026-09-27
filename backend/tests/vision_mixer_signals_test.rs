@@ -199,7 +199,7 @@ async fn punch_in_taken_to_plain_input_reports_morph() {
         .apply_vision_mixer_pip_config(block_id, 0, Some(1), vec![], crop)
         .expect("pip config");
 
-    let result = manager.trigger_transition(block_id, 0, 1, "fade", 500);
+    let result = manager.trigger_transition(block_id, Some(0), Some(1), "fade", 500);
 
     let _ = manager.stop();
     strom::blocks::builtin::vision_mixer::overlay::unregister_flow(&flow.id);

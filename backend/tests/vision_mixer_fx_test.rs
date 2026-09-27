@@ -704,7 +704,7 @@ async fn master_fx_take_out_of_a_pip_reports_the_effect() {
         .apply_vision_mixer_pip_config(PIP_BLOCK_ID, 0, Some(1), vec![], crop)
         .expect("pip config");
 
-    let result = manager.trigger_transition(PIP_BLOCK_ID, 0, 1, "glitch_cut", 200);
+    let result = manager.trigger_transition(PIP_BLOCK_ID, Some(0), Some(1), "glitch_cut", 200);
 
     manager.stop().expect("stop");
     strom::blocks::builtin::vision_mixer::overlay::unregister_flow(&flow.id);
