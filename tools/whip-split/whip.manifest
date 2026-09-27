@@ -1,0 +1,169 @@
+# Split of whip.rs and whip_session_manager.rs into directory modules.
+# Every item is listed, including items from open PRs not yet on
+# upstream/main (marked with the PR); split.py refuses to run if the source
+# has an item this file does not place.
+
+source backend/src/blocks/builtin/whip.rs
+module mod //! (keeps the file's own header)
+module slot_chain //! WHIP Input per-slot output chains, built once with the flow.
+module watchdog //! Per-session inactivity watchdog for WHIP Input.
+module session //! One isolated whipserversrc pipeline per WHIP client session, bridged into its slot.
+module output //! WHIP Output: whipclientsink and the legacy whipsink.
+module definition //! WHIP Output and WHIP Input block definitions.
+
+/fn slot_audio_caps = slot_chain
+/fn lock_slot_audio_caps = slot_chain
+/struct WHIPOutputBuilder = mod
+/struct WHIPInputBuilder = mod
+impl BlockBuilder for WHIPOutputBuilder/fn build = mod
+impl BlockBuilder for WHIPInputBuilder/fn build = mod
+impl BlockBuilder for WHIPInputBuilder/fn get_external_pads = mod
+/fn parse_jitterbuffer_latency_ms = slot_chain
+/fn parse_do_retransmission = slot_chain
+/fn parse_drop_on_latency = slot_chain
+/fn prepare_idle_decodebin = slot_chain
+/fn stamp_slot_output = slot_chain
+/fn build_whipserversrc = slot_chain
+/const INACTIVITY_TIMEOUT = watchdog
+/const _ = watchdog
+/const WATCHDOG_POLL = watchdog
+/fn wait_until_deadline_or_stop = watchdog
+/fn wait_for_inactivity = watchdog
+# from #787
+/fn attach_session_branch = session
+# from #759
+/fn install_slot_bridge = session
+/struct CreatedSession = session
+/fn create_whipserversrc_for_session = session
+/fn forward_sample_to_slot = session
+/fn build_whipclientsink = output
+/fn build_whipsink = output
+/fn get_blocks = definition
+/fn whip_output_definition = definition
+/fn whip_input_definition = definition
+/fn setup_incoming_rtp_handler = output
+tests/fn props = slot_chain
+tests/fn jitterbuffer_latency_ms_defaults_to_400 = slot_chain
+tests/fn jitterbuffer_latency_ms_respects_explicit_value = slot_chain
+tests/fn jitterbuffer_latency_ms_clamps_negative_to_zero = slot_chain
+tests/fn do_retransmission_defaults_to_true = slot_chain
+tests/fn do_retransmission_respects_explicit_true = slot_chain
+tests/fn drop_on_latency_defaults_to_true = slot_chain
+tests/fn drop_on_latency_respects_explicit_false = slot_chain
+tests/fn do_retransmission_respects_explicit_false = slot_chain
+tests/fn watchdog_wait_returns_as_soon_as_the_stop_flag_is_set = watchdog
+tests/fn watchdog_wait_runs_to_the_deadline_when_not_stopped = watchdog
+tests/fn watchdog_detects_inactivity_within_one_poll_of_the_timeout = watchdog
+tests/fn watchdog_inactivity_wait_gives_up_when_stopped = watchdog
+tests/fn watchdog_reaps_a_session_that_receives_media_it_never_decodes = watchdog
+tests/fn assemble = slot_chain
+tests/fn i420_frame = slot_chain
+tests/fn wait_for = slot_chain
+tests/fn the_slot_stamp_follows_media_out_of_the_decode_chain_not_into_it = slot_chain
+tests/fn do_retransmission_reaches_whip_endpoint_config = slot_chain
+tests/fn drop_on_latency_reaches_whip_endpoint_config = slot_chain
+tests/fn a_finished_session_stops_feeding_its_slot = session
+# from #759
+tests/fn an_unstamped_buffer_never_reaches_the_slot_appsrc = session
+
+replace backend/static/tests/whip_reconnect.test.js // backend/src/blocks/builtin/whip.rs INACTIVITY_TIMEOUT. => // backend/src/blocks/builtin/whip/watchdog.rs INACTIVITY_TIMEOUT.
+
+source backend/src/whip_session_manager.rs
+module mod //! (keeps the file's own header)
+module endpoint //! Per-endpoint configuration and slot allocation.
+module activity //! Session liveness: the activity stamps and how a session is judged idle.
+module takeover //! Slot takeover: displacing a session that no longer produces usable media.
+module test_support #[cfg(test)] //! Fixtures shared by the session manager's tests.
+
+/struct WhipEndpointConfig = endpoint
+impl WhipEndpointConfig/fn allocate_slot = endpoint
+impl WhipEndpointConfig/fn activate_slot_decoders = endpoint
+impl WhipEndpointConfig/fn release_slot = endpoint
+/struct SessionCleanupRequest = endpoint
+/struct ActivityStamp = activity
+impl ActivityStamp/fn new = activity
+impl ActivityStamp/fn touch = activity
+impl ActivityStamp/fn reset = activity
+impl ActivityStamp/fn last = activity
+impl ActivityStamp/fn since_last = activity
+impl ActivityStamp/fn since_first = activity
+impl ActivityStamp/fn backdated = activity
+impl ActivityStamp/fn since = activity
+/enum StallSide = activity
+impl std::fmt::Display for StallSide/fn fmt = activity
+/struct SessionActivity = activity
+impl SessionActivity/fn new = activity
+impl SessionActivity/fn from_stamps = activity
+impl SessionActivity/fn video_only_from_stamps = activity
+impl SessionActivity/fn touch_ingress = activity
+impl SessionActivity/fn has_delivered_audio = activity
+impl SessionActivity/fn last_usable = activity
+impl SessionActivity/fn idle = activity
+/struct WhipSession = mod
+/struct WhipSessionPipeline = mod
+/struct NewWhipSession = mod
+/struct WhipSessionManager = mod
+/const PENDING_CLEANUP_TTL = mod
+# from #763
+/const TEARDOWN_TIMEOUT = mod
+/const DECODE_GRACE = activity
+/const STALL_SIDE_MARGIN = activity
+/const TAKEOVER_IDLE_THRESHOLD = takeover
+/const TAKEOVER_WAIT = takeover
+/const TAKEOVER_POLL = takeover
+/struct IdlestSession = takeover
+impl WhipSessionManager/fn new = mod
+impl WhipSessionManager/fn cleanup_sender = mod
+impl WhipSessionManager/fn start_cleanup_task = mod
+impl WhipSessionManager/fn run_cleanup_loop = mod
+impl WhipSessionManager/fn register_endpoint = mod
+impl WhipSessionManager/fn get_endpoint_config = mod
+impl WhipSessionManager/fn register_session = mod
+impl WhipSessionManager/fn allocate_slot_or_take_over = takeover
+impl WhipSessionManager/fn idlest_session = takeover
+impl WhipSessionManager/fn sessions_for_endpoint = mod
+impl WhipSessionManager/fn get_session_port = mod
+impl WhipSessionManager/fn get_session_info = mod
+impl WhipSessionManager/fn remove_session = mod
+impl WhipSessionManager/fn remove_session_by_port = mod
+impl WhipSessionManager/fn remove_all_sessions = mod
+impl WhipSessionManager/fn unregister_endpoint = mod
+impl WhipSessionManager/fn list_endpoints = mod
+impl WhipSessionManager/fn cleanup_dynamic_webrtcbin_store = mod
+impl WhipSessionManager/fn teardown_session_pipeline = mod
+impl Default for WhipSessionManager/fn default = mod
+tests/fn dummy_session = test_support
+tests/const RUNNING_FOR = test_support
+tests/fn tick_until_stopped = test_support
+tests/fn dead_publisher = test_support
+tests/fn live_publisher = test_support
+tests/fn sparse_video_publisher = test_support
+tests/fn receiving_but_never_usable = test_support
+tests/fn receiving_but_stalled = test_support
+tests/fn still_prerolling = test_support
+tests/fn no_media_yet = test_support
+tests/fn endpoint_config = test_support
+tests/fn full_endpoint = test_support
+tests/fn register = test_support
+tests/fn register_with_activity = test_support
+tests/fn register_in_slot = test_support
+tests/fn remove_session_stops_the_watchdog = mod
+tests/fn remove_session_by_port_stops_the_watchdog = mod
+tests/fn remove_all_sessions_stops_the_watchdog = mod
+tests/fn expired_pending_cleanup_mark_does_not_reject_a_recycled_port = mod
+tests/fn fresh_pending_cleanup_mark_still_rejects_the_session = mod
+tests/fn a_dead_session_gives_its_slot_to_a_new_client = takeover
+tests/fn a_session_that_died_moments_before_the_post_is_still_displaced = takeover
+tests/fn a_live_session_is_never_displaced = takeover
+tests/fn a_session_receiving_media_it_never_decodes_is_displaced = takeover
+tests/fn a_session_whose_output_has_stalled_is_displaced = takeover
+tests/fn a_session_still_waiting_for_its_first_decoded_frame_is_not_displaced = takeover
+tests/fn a_new_session_does_not_inherit_the_slots_previous_liveness = activity
+tests/fn a_predecessors_trailing_frames_do_not_cut_the_decode_grace_short = activity
+tests/fn a_reaped_session_names_which_side_of_the_chain_stopped = activity
+tests/fn a_session_that_has_not_delivered_media_yet_is_not_displaced = takeover
+tests/fn a_sparse_video_only_session_is_not_displaced = takeover
+tests/fn a_dead_session_is_displaced_past_a_quieter_video_only_one = takeover
+
+replace mod Shared with the callbacks in `whip.rs`. => Shared with the callbacks in `whip/session.rs`.
+replace activity which `whip.rs` asserts at compile time. => which `whip/watchdog.rs` asserts at compile time.
