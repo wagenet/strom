@@ -7,8 +7,8 @@
 use super::state::MediaPlayerState;
 use crate::blocks::BlockBuildError;
 use crate::events::EventBroadcaster;
-use crate::gst::rtp_hdrext;
 use crate::gst::pipeline_bridge;
+use crate::gst::rtp_hdrext;
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
