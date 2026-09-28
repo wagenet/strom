@@ -239,7 +239,7 @@ async fn unknown_transition_out_of_a_pip_is_refused() {
         .expect("pip config");
     assert!(manager.fade_to_black(block_id, 200).expect("ftb"));
 
-    let result = manager.trigger_transition(block_id, 0, 1, "morph", 500);
+    let result = manager.trigger_transition(block_id, Some(0), Some(1), "morph", 500);
     let s = strom::blocks::builtin::vision_mixer::overlay::get_overlay_state(block_id)
         .expect("overlay state registered");
     let (pgm_pip, pvw_input, ftb) = (s.pgm_pip(), s.pvw_input(), ftb_active(block_id));
@@ -266,7 +266,7 @@ async fn unknown_transition_between_inputs_keeps_fade_to_black() {
     let mut manager = start(&flow, block_id).await;
     assert!(manager.fade_to_black(block_id, 200).expect("ftb"));
 
-    let result = manager.trigger_transition(block_id, 0, 1, "morph", 500);
+    let result = manager.trigger_transition(block_id, Some(0), Some(1), "morph", 500);
     let ftb = ftb_active(block_id);
 
     let _ = manager.stop();
