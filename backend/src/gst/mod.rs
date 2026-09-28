@@ -22,7 +22,6 @@ pub mod thumbnail_tap;
 pub mod transitions;
 pub(crate) mod underlay;
 pub mod unpremultiply;
-pub mod video_frame;
 /// vImage-backed video conversion. macOS only: the element wraps Accelerate.
 #[cfg(target_os = "macos")]
 pub mod vimage;
