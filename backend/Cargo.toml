@@ -34,9 +34,6 @@ serde_json.workspace = true
 # Date/time
 chrono = "0.4"
 
-# URL encoding
-urlencoding = "2.1"
-
 # Logging
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -125,8 +122,6 @@ network-interface = "2.0"
 # HTTP client for test harness
 reqwest.workspace = true
 
-# Terminal UI for test harness
-crossterm = "0.29"
 
 # Network discovery
 socket2 = "0.6"      # Multicast socket options for SAP
@@ -161,7 +156,6 @@ winresource = "0.1"
 tempfile = "3.27"
 tokio = { version = "1.52", features = ["full", "test-util"] }
 tower = { version = "0.5", features = ["util"] }
-http-body-util = "0.1"
 serial_test = "4.0"
 
 [[bin]]
