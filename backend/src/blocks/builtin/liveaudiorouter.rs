@@ -475,6 +475,14 @@ impl BlockBuilder for LiveAudioRouterBuilder {
                 .build()
                 .map_err(|e| BlockBuildError::ElementCreation(format!("identity: {e}")))?;
             watch_input_channels(&identity, in_idx, channels);
+            if force_live {
+                if let Some(pad) = identity.static_pad("sink") {
+                    crate::blocks::builtin::mixer::drop_input_eos(
+                        &pad,
+                        format!("Live Audio Router {instance_id} input {in_idx}"),
+                    );
+                }
+            }
             elements.push((identity_id.clone(), identity));
 
             let deint_id = format!("{instance_id}:deinterleave_in_{in_idx}");
