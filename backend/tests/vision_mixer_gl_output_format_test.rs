@@ -171,7 +171,7 @@ fn build_manager(gl_download: bool) -> PipelineManager {
 
     let temp_file = NamedTempFile::new().unwrap();
     let registry = BlockRegistry::new(temp_file.path());
-    let events = EventBroadcaster::new(10);
+    let events = EventBroadcaster::new(10, false, false);
 
     PipelineManager::new(
         &build_flow(gl_download),
@@ -548,7 +548,7 @@ async fn keyed_dsk_alpha_survives_nv12_on_gpu() {
 
     let temp_file = tempfile::NamedTempFile::new().unwrap();
     let registry = BlockRegistry::new(temp_file.path());
-    let events = EventBroadcaster::new(10);
+    let events = EventBroadcaster::new(10, false, false);
     let mut manager = PipelineManager::new(
         &build_keyed_flow(),
         events,

@@ -104,7 +104,7 @@ async fn start(flow: &Flow, block_id: &str) -> PipelineManager {
     let registry = BlockRegistry::new(temp_file.path());
     let mut manager = PipelineManager::new(
         flow,
-        EventBroadcaster::new(10),
+        EventBroadcaster::new(10, false, false),
         &registry,
         vec![],
         "all".to_string(),

@@ -1136,7 +1136,7 @@ async fn blocks_survive_a_restart_of_the_other_flow_and_release_everything() {
     let manager = |flow: &Flow| {
         PipelineManager::new(
             flow,
-            EventBroadcaster::new(10),
+            EventBroadcaster::new(10, false, false),
             &registry,
             vec![],
             "all".to_string(),

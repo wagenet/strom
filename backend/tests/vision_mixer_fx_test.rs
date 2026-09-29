@@ -656,7 +656,7 @@ async fn master_fx_take_out_of_a_pip_reports_the_effect() {
     let registry = BlockRegistry::new(temp_file.path());
     let mut manager = PipelineManager::new(
         &flow,
-        EventBroadcaster::new(10),
+        EventBroadcaster::new(10, false, false),
         &registry,
         vec![],
         "all".to_string(),
@@ -778,7 +778,7 @@ async fn gpu_mixer_reports_media_age_per_input() {
     let registry = BlockRegistry::new(temp_file.path());
     let mut manager = PipelineManager::new(
         &flow,
-        EventBroadcaster::new(10),
+        EventBroadcaster::new(10, false, false),
         &registry,
         vec![],
         "all".to_string(),

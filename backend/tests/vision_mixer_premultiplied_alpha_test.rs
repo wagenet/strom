@@ -233,7 +233,7 @@ impl Running {
         let flow = build_flow(backend, block_id, alpha_mode, dsk);
         let mut manager = PipelineManager::new(
             &flow,
-            EventBroadcaster::new(10),
+            EventBroadcaster::new(10, false, false),
             &registry,
             vec![],
             "all".to_string(),

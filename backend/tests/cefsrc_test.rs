@@ -135,6 +135,8 @@ fn new_state() -> (AppState, NamedTempFile, NamedTempFile) {
         vec![],
         "all".to_string(),
         vec![],
+        false,
+        false,
     );
     (state, storage_file, blocks_file)
 }
