@@ -21,8 +21,8 @@ use crate::gst::orphan_guard;
 use crate::gst::rtp_hdrext;
 use crate::gst::pipeline_bridge::{self, SessionBridge};
 use crate::whip_session_manager::{
-    Medium, SessionActivity, SessionCleanupRequest, SlotOutput, StallSide, WhipEndpointConfig,
-    WhipSlotLiveness, DECODE_GRACE,
+    Medium, SessionActivity, SessionCleanupRequest, SlotDecodebin, SlotOutput, StallSide,
+    WhipEndpointConfig, WhipSlotLiveness, DECODE_GRACE,
 };
 use gstreamer as gst;
 use gstreamer::prelude::*;
@@ -390,7 +390,7 @@ pub fn build_whipserversrc(
     let mut slot_video_appsrcs: Vec<gst_app::AppSrc> = Vec::new();
     // Per-slot decodebins, locked until a session claims the slot. Weak refs:
     // the pipeline owns them.
-    let mut slot_decodebins: Vec<Vec<gst::glib::WeakRef<gst::Element>>> = Vec::new();
+    let mut slot_decodebins: Vec<Vec<SlotDecodebin>> = Vec::new();
 
     // One record per slot, one stamp per medium inside it, written by a probe on
     // that slot's output tees below. This is where a session's media becomes
@@ -403,7 +403,7 @@ pub fn build_whipserversrc(
         .collect();
 
     for (slot, output_stamp) in slot_output.iter().enumerate() {
-        let mut decodebins_for_slot: Vec<gst::glib::WeakRef<gst::Element>> = Vec::new();
+        let mut decodebins_for_slot: Vec<SlotDecodebin> = Vec::new();
 
         // Audio chain for this slot
         if mode.has_audio() {
@@ -443,7 +443,12 @@ pub fn build_whipserversrc(
                     })?;
 
                 prepare_idle_decodebin(&decodebin);
-                decodebins_for_slot.push(decodebin.downgrade());
+                // Audio keeps its running chain across sessions; only the
+                // video decoder fails on reuse (see `restart_decodebin`).
+                decodebins_for_slot.push(SlotDecodebin {
+                    element: decodebin.downgrade(),
+                    restart_on_reuse: false,
+                });
 
                 let audioconvert = gst::ElementFactory::make("audioconvert")
                     .name(&audioconvert_id)
@@ -567,7 +572,10 @@ pub fn build_whipserversrc(
                     })?;
 
                 prepare_idle_decodebin(&decodebin);
-                decodebins_for_slot.push(decodebin.downgrade());
+                decodebins_for_slot.push(SlotDecodebin {
+                    element: decodebin.downgrade(),
+                    restart_on_reuse: true,
+                });
 
                 let videoconvert = gst::ElementFactory::make("videoconvert")
                     .name(&videoconvert_id)
