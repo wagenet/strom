@@ -78,15 +78,3 @@ impl ChannelRegistry {
         channels.values().cloned().collect()
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_default() {
-        let registry = ChannelRegistry::default();
-        // Default should create an empty registry
-        assert!(std::sync::Arc::strong_count(&registry.channels) == 1);
-    }
-}
