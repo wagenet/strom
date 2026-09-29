@@ -447,7 +447,7 @@ async fn source_resized_during_a_fade_is_fitted_after_it() {
     let start = running.position(block_id);
     running
         .manager
-        .trigger_transition(block_id, 0, 1, "fade", 4000)
+        .trigger_transition(block_id, Some(0), Some(1), "fade", 4000)
         .expect("fade");
     running
         .manager
@@ -680,7 +680,7 @@ async fn pip_crop_follows_a_source_resized_during_ftb() {
         .expect("PiP to PVW");
     running
         .manager
-        .trigger_transition(block_id, 0, 0, "cut", 0)
+        .trigger_transition(block_id, Some(0), Some(0), "cut", 0)
         .expect("take the PiP");
     let pad = running
         .element(&format!("{block_id}:mixer"))
