@@ -152,3 +152,32 @@ async fn pad_enum_property_reads_as_nick_and_round_trips() {
         "enum property missing from the pad listing"
     );
 }
+
+/// Reading a pad that does not exist reports it missing and leaves the element
+/// alone. Requesting one instead left an unlinked input on the compositor for
+/// the life of the flow, one per pad name a client asked about.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reading_a_missing_pad_does_not_create_it() {
+    use gstreamer::prelude::*;
+
+    gstreamer::init().unwrap();
+    let temp_file = NamedTempFile::new().unwrap();
+    let registry = BlockRegistry::new(temp_file.path());
+    let manager = build_manager(&registry);
+
+    assert!(manager.get_pad_properties("mix", "sink_5").is_err());
+    assert!(manager
+        .get_pad_property("mix", "sink_6", "sizing-policy")
+        .is_err());
+
+    let mix = manager
+        .pipeline()
+        .by_name("mix")
+        .expect("the flow's compositor");
+    let sinks: Vec<String> = mix
+        .sink_pads()
+        .iter()
+        .map(|p| p.name().to_string())
+        .collect();
+    assert_eq!(sinks, vec!["sink_0"], "a read requested pads on the mixer");
+}
