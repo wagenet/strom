@@ -1,7 +1,7 @@
 //! GStreamer integration.
 
-pub mod audio_bridge;
 pub(crate) mod aggregator_start;
+pub mod audio_bridge;
 mod block_expansion;
 pub mod buffer_age_probe;
 pub(crate) mod control_bindings;
@@ -22,10 +22,10 @@ pub mod thumbnail_tap;
 pub mod transitions;
 pub(crate) mod underlay;
 pub mod unpremultiply;
+pub mod video_input_bridge;
 /// vImage-backed video conversion. macOS only: the element wraps Accelerate.
 #[cfg(target_os = "macos")]
 pub mod vimage;
-pub mod video_input_bridge;
 pub mod volume_ramp;
 pub mod whep_probe;
 

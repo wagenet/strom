@@ -201,7 +201,9 @@ impl BlockBuilder for LocalInputBuilder {
                 caps.append_structure(structure.clone());
                 caps.append_structure_full(
                     structure,
-                    Some(gst::CapsFeatures::new([video_input_bridge::GL_MEMORY_FEATURE])),
+                    Some(gst::CapsFeatures::new([
+                        video_input_bridge::GL_MEMORY_FEATURE,
+                    ])),
                 );
             }
 
