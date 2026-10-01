@@ -146,9 +146,7 @@ async fn reading_a_missing_pad_does_not_create_it() {
     use gstreamer::prelude::*;
 
     gstreamer::init().unwrap();
-    let temp_file = NamedTempFile::new().unwrap();
-    let registry = BlockRegistry::new(temp_file.path());
-    let manager = build_manager(&registry);
+    let manager = build_manager();
 
     assert!(manager.get_pad_properties("mix", "sink_5").is_err());
     assert!(manager
