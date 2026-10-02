@@ -128,6 +128,10 @@ def split(spec, repo):
     header = m.group(1) if m else ""
     body = src[m.end():] if m else src
 
+    # Absolute path of the source's parent module, e.g. `crate::blocks::builtin`.
+    rel = spec["source"].split("src/", 1)[1]
+    parent_path = "::".join(["crate"] + os.path.dirname(rel).split("/")).rstrip(":")
+
     items = keys.keyed(body)
     uses, test_uses = [], []
     placed = {mod: [] for mod in modules}  # (container, text, key)
@@ -148,7 +152,12 @@ def split(spec, repo):
                 sys.exit("stray comment block not attached to an item:\n" + text)
             continue
         if key == "use":
-            (test_uses if cont == "tests" else uses).append(text.strip())
+            if cont == "tests":
+                test_uses.append(text.strip())
+            else:
+                # A file-level `use super::` names the source's parent, which
+                # the new submodules are one level further from.
+                uses.append(re.sub(r"^use super::", "use %s::" % parent_path, text.strip()))
             continue
         full = cont + "/" + key
         if full not in spec["place"]:

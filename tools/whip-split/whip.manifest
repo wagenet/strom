@@ -24,6 +24,8 @@ impl BlockBuilder for WHIPInputBuilder/fn get_external_pads = mod
 /fn prepare_idle_decodebin = slot_chain
 /fn stamp_slot_output = slot_chain
 /fn build_whipserversrc = slot_chain
+/fn watch_depayloader_for_damage = slot_chain
+/fn log_recovery_step = session
 /const INACTIVITY_TIMEOUT = watchdog
 /const _ = watchdog
 /const WATCHDOG_POLL = watchdog
@@ -35,6 +37,13 @@ impl BlockBuilder for WHIPInputBuilder/fn get_external_pads = mod
 /fn install_slot_bridge = session
 /struct CreatedSession = session
 /fn create_whipserversrc_for_session = session
+/const MAX_PTS_NUDGE_NS = session
+/struct VideoPtsOrder = session
+impl VideoPtsOrder/fn new = session
+impl VideoPtsOrder/fn order = session
+/enum SlotMedia = session
+impl SlotMedia<'_>/fn name = session
+/fn order_video_pts = session
 /fn forward_sample_to_slot = session
 /fn build_whipclientsink = output
 /fn build_whipsink = output
@@ -65,8 +74,13 @@ tests/fn drop_on_latency_reaches_whip_endpoint_config = slot_chain
 tests/fn a_finished_session_stops_feeding_its_slot = session
 # from #759
 tests/fn an_unstamped_buffer_never_reaches_the_slot_appsrc = session
+tests/fn bridge_video_packets = session
+tests/fn video_frames_on_one_pts_reach_the_slot_in_order = session
+tests/fn video_b_frames_keep_their_pts = session
+tests/fn video_frame_far_ahead_does_not_hold_back_later_frames = session
 
 replace backend/static/tests/whip_reconnect.test.js // backend/src/blocks/builtin/whip.rs INACTIVITY_TIMEOUT. => // backend/src/blocks/builtin/whip/watchdog.rs INACTIVITY_TIMEOUT.
+replace backend/src/gst/pipeline_bridge.rs /// `whip.rs`. The caller has => /// `whip/session.rs`. The caller has
 
 source backend/src/whip_session_manager.rs
 module mod //! (keeps the file's own header)
@@ -75,7 +89,9 @@ module activity //! Session liveness: the activity stamps and how a session is j
 module takeover //! Slot takeover: displacing a session that no longer produces usable media.
 module test_support #[cfg(test)] //! Fixtures shared by the session manager's tests.
 
+/struct SlotDecodebin = endpoint
 /struct WhipEndpointConfig = endpoint
+/fn restart_decodebin = endpoint
 impl WhipEndpointConfig/fn allocate_slot = endpoint
 impl WhipEndpointConfig/fn activate_slot_decoders = endpoint
 impl WhipEndpointConfig/fn release_slot = endpoint

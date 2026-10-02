@@ -23,7 +23,7 @@ python3 $T/verify.py HEAD      # after `git add -A`, before committing
   `CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0`.
 - `verify.py` compares the code lines of the old files with the new ones,
   ignoring imports, indentation and `pub(super)`. What remains should be
-  module scaffolding and the three path comments the manifest rewrites.
+  module scaffolding and the path comments the manifest rewrites.
 
-The same manifest regenerates PR 854 on upstream/main + #756 and the
+The same manifest regenerates PR 854 on upstream/main and the
 integration branch on top of every open WHIP PR.
