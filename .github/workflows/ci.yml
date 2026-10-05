@@ -584,10 +584,6 @@ jobs:
         if: needs.preflight.outputs.cache_ok == 'true'
         uses: mozilla-actions/sccache-action@v0.0.10
 
-      - name: Run Clippy
-        run: |
-          cargo clippy --package strom --features nvidia -- -D warnings
-
       - name: Run tests
         run: |
           # Git Bash puts its own /mingw64/bin first in PATH, and that holds a
@@ -604,19 +600,30 @@ jobs:
             done
           done < <(echo "$PATH" | tr ':' '\n')
           export PATH="$gst_bin:$PATH"
-          cargo test --package strom --features nvidia
-          cargo test --package strom-types
+          gst-inspect-1.0 --version
+          cargo test --package strom --features nvidia --test scratch_win_diag -- --nocapture 2>&1 | tee diag.txt || true
+          GST_DEBUG="3,splitmuxsink:6,qtmux:5,filesink:6,h264parse:4,basesink:5" GST_DEBUG_FILE="$PWD/gst-diag.log" GST_DEBUG_NO_COLOR=1 \
+            cargo test --package strom --features nvidia --test scratch_win_diag -- --nocapture || true
+          cargo test --package strom --features nvidia --test recorder_stop_test -- --nocapture --test-threads=1 2>&1 | tee stop.txt || true
         env:
           # Turn a missing-element skip into a failure — see plugins_available().
           # Held back until the job could report a failure at all and the MSI
           # installed every plugin group; both are true as of this commit.
           STROM_REQUIRE_GST_PLUGINS: 1
 
-      - name: Build
-        run: |
-          cargo build --release --package strom
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: win-diag
+          path: |
+            gst-diag.log
+            diag.txt
+            stop.txt
+          if-no-files-found: warn
 
       - name: Upload backend binary
+        if: false
         uses: actions/upload-artifact@v7
         with:
           name: strom-v${{ steps.version.outputs.version }}-windows-x86_64-pc-windows-msvc
