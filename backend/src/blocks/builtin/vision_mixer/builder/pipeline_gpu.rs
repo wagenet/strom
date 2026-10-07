@@ -632,6 +632,7 @@ pub(super) fn build_gpu_pipeline(
         let num_pips = p.num_pips;
         let underlay_state = std::sync::Arc::clone(&overlay_state);
         let dist_weak = dist_weak.clone();
+        let activity_state = std::sync::Arc::clone(&overlay_state);
         ctx.register_element_setup(Box::new(move |_flow_id, _events| {
             let (Some(mixer), Some(mv_comp)) = (dist_weak.upgrade(), mv_weak.upgrade()) else {
                 return;
@@ -644,6 +645,12 @@ pub(super) fn build_gpu_pipeline(
             if num_pips > 0 {
                 super::super::underlays::watch(&underlay_state, &mixer, &mv_comp);
             }
+            super::super::activity::install_input_activity_probes(
+                &block_id,
+                &mixer,
+                &activity_state,
+                num_inputs,
+            );
         }));
     }
 
