@@ -420,6 +420,11 @@ pub struct Flow {
     /// Prefer [`running`](Self::running) for logic and display.
     #[serde(default)]
     pub gst_state: Option<PipelineState>,
+    /// Per-block runtime health. Populated only while a pipeline is running;
+    /// empty otherwise. An entry with a failed status means that block has
+    /// stopped passing data even though `gst_state` is still `Playing`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub block_health: Vec<BlockHealth>,
     /// Flow configuration properties
     #[serde(default)]
     pub properties: FlowProperties,
@@ -436,6 +441,7 @@ impl Flow {
             links: Vec::new(),
             running: false,
             gst_state: Some(PipelineState::Null),
+            block_health: Vec::new(),
             properties: FlowProperties::default(),
         }
     }
@@ -450,6 +456,7 @@ impl Flow {
             links: Vec::new(),
             running: false,
             gst_state: Some(PipelineState::Null),
+            block_health: Vec::new(),
             properties: FlowProperties::default(),
         }
     }
@@ -522,6 +529,119 @@ impl Flow {
         }
         unwired
     }
+
+    /// Blocks whose element chain has stopped passing data.
+    pub fn failed_blocks(&self) -> impl Iterator<Item = &BlockHealth> {
+        self.block_health.iter().filter(|h| h.status.is_failed())
+    }
+
+    /// Whether any block in this flow has failed.
+    ///
+    /// `running` only reports that the pipeline reached `Playing`; it stays
+    /// `true` when a block underneath has stopped. Callers deciding whether a
+    /// flow is actually working need both.
+    pub fn has_failed_block(&self) -> bool {
+        self.failed_blocks().next().is_some()
+    }
+}
+
+/// Health of a single block's element chain while the flow is running.
+///
+/// Pausing a pad task is not a state change: the pipeline and every element in
+/// it stay `PLAYING` while that branch stops passing data, so the failure does
+/// not show up in the flow's `gst_state`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(ToSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum BlockHealthStatus {
+    /// No stopped pad task was found in this block's element chain.
+    Ok,
+    /// A pad task in this block's element chain has stopped. The block is not
+    /// passing data, regardless of what the pipeline state says.
+    Failed,
+}
+
+impl BlockHealthStatus {
+    /// Whether this status means the block has failed.
+    pub fn is_failed(&self) -> bool {
+        matches!(self, BlockHealthStatus::Failed)
+    }
+}
+
+/// Runtime health of one block in a running flow.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(ToSchema))]
+pub struct BlockHealth {
+    /// Block instance ID this health report belongs to.
+    pub block_id: String,
+    /// Whether the block's element chain is running or has stopped.
+    pub status: BlockHealthStatus,
+    /// Human-readable detail naming the element and pad whose task stopped.
+    /// `None` when the block is healthy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// What failed, for a client that acts on the failure instead of showing
+    /// `detail`. Empty when the block is healthy, and when the scan that
+    /// found the failure has no structured cause to give.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub causes: Vec<BlockHealthCause>,
+}
+
+/// One structured reason a block reported failed.
+///
+/// A block can carry several at once: a WHIP Input block has one seat per
+/// slot, and each can lose a medium on its own. Clients should ignore a
+/// `kind` they do not know.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(ToSchema))]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BlockHealthCause {
+    /// One medium of an occupied WHIP Input seat is not reaching the flow.
+    WhipMedium {
+        /// The seat's slot index within the block.
+        slot: u32,
+        /// The medium that is missing.
+        medium: HealthMedium,
+        /// Where the medium stops.
+        fault: MediumFault,
+    },
+}
+
+/// A medium named in a [`BlockHealthCause`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(ToSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum HealthMedium {
+    Audio,
+    Video,
+}
+
+impl HealthMedium {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            HealthMedium::Audio => "audio",
+            HealthMedium::Video => "video",
+        }
+    }
+}
+
+/// Where a missing medium stops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum MediumFault {
+    /// The publisher sent this medium and then stopped while still sending the
+    /// other one: a microphone unplugged, a browser track that ended. Nothing in
+    /// the flow is at fault, the session is not reaped for it, and reconnecting
+    /// with the same track does not help.
+    PublisherStopped,
+    /// The publisher has sent none of this medium although the endpoint takes
+    /// it, while sending the other one.
+    NeverSent,
+    /// The medium still arrives from the publisher, but none of it comes out of
+    /// the slot's decode chain. The fault is inside the flow; the session is
+    /// reaped if it lasts.
+    NotProduced,
 }
 
 #[cfg(test)]
