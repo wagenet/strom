@@ -552,8 +552,7 @@ async fn master_fx_take_out_of_a_pip_reports_the_effect() {
         );
     }
 
-    let mut manager = common::manager::build(&flow)
-    .expect("build GPU pipeline");
+    let mut manager = common::manager::build(&flow).expect("build GPU pipeline");
     manager.start().expect("start GPU pipeline");
 
     let mixer = manager
@@ -661,8 +660,7 @@ async fn gpu_mixer_reports_media_age_per_input() {
         }
     }
 
-    let mut manager = common::manager::build(&flow)
-    .expect("build GPU pipeline");
+    let mut manager = common::manager::build(&flow).expect("build GPU pipeline");
     manager.start().expect("start GPU pipeline");
 
     let mixer = manager
@@ -687,8 +685,9 @@ async fn gpu_mixer_reports_media_age_per_input() {
     // Frames already queued past the valve keep reaching the mixer for a
     // while, longer on a loaded runner, so wait for the gap instead of a
     // fixed time.
-    let s = strom::blocks::builtin::vision_mixer::overlay::get_overlay_state(&flow.id, AGE_BLOCK_ID)
-        .expect("overlay state registered");
+    let s =
+        strom::blocks::builtin::vision_mixer::overlay::get_overlay_state(&flow.id, AGE_BLOCK_ID)
+            .expect("overlay state registered");
     let read =
         || -> Vec<Option<u64>> { (0..s.num_inputs).map(|i| s.input_media_age_ms(i)).collect() };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
