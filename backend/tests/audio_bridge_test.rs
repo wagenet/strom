@@ -91,7 +91,9 @@ fn run(
                 let map = buffer.map_readable().unwrap();
                 let left: Vec<f32> = map
                     .as_slice()
-                    .chunks_exact(8)
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
                     .map(|f| f32::from_le_bytes([f[0], f[1], f[2], f[3]]))
                     .collect();
                 let mut out = out.lock().unwrap();
@@ -611,7 +613,9 @@ fn a_producer_faster_than_real_time_is_reported_once_and_keeps_playing() {
                         let map = buffer.map_readable().unwrap();
                         let peak = map
                             .as_slice()
-                            .chunks_exact(4)
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
                             .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]).abs())
                             .fold(0.0, f32::max);
                         sink_peaks.lock().unwrap().push(peak);
@@ -724,7 +728,9 @@ fn a_producer_handover_after_an_overrun_does_not_click() {
                     let map = sample.buffer().unwrap().map_readable().unwrap();
                     sink_samples.lock().unwrap().extend(
                         map.as_slice()
-                            .chunks_exact(8)
+                            .as_chunks::<8>()
+                            .0
+                            .iter()
                             .map(|f| f32::from_le_bytes([f[0], f[1], f[2], f[3]])),
                     );
                     Ok(gst::FlowSuccess::Ok)
@@ -836,7 +842,9 @@ fn a_dropout_fades_out_even_when_nothing_is_left_to_fade() {
                     let map = sample.buffer().unwrap().map_readable().unwrap();
                     sink_samples.lock().unwrap().extend(
                         map.as_slice()
-                            .chunks_exact(8)
+                            .as_chunks::<8>()
+                            .0
+                            .iter()
                             .map(|f| f32::from_le_bytes([f[0], f[1], f[2], f[3]])),
                     );
                     Ok(gst::FlowSuccess::Ok)
@@ -969,7 +977,9 @@ fn an_overrun_ends_with_its_producer() {
                     let map = sample.buffer().unwrap().map_readable().unwrap();
                     let peak = map
                         .as_slice()
-                        .chunks_exact(4)
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
                         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]).abs())
                         .fold(0.0, f32::max);
                     if l.lock().unwrap().is_some() && peak > 0.1 {

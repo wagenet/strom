@@ -255,7 +255,7 @@ fn fade(data: &mut [u8], frames: usize, rising: bool) {
         let up = 0.5 - 0.5 * (std::f32::consts::PI * x).cos();
         let gain = if rising { up } else { 1.0 - up };
         let frame = &mut data[(first + i) * BPF..(first + i + 1) * BPF];
-        for sample in frame.chunks_exact_mut(4) {
+        for sample in frame.as_chunks_mut::<4>().0 {
             let v = f32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]]) * gain;
             sample.copy_from_slice(&v.to_le_bytes());
         }
@@ -277,7 +277,7 @@ fn fade_out_to_silence(data: &mut [u8], got: usize, last: &[u8; BPF]) -> usize {
     if got > 0 {
         held.copy_from_slice(&data[(got - 1) * BPF..got * BPF]);
     }
-    for frame in data[got * BPF..len * BPF].chunks_exact_mut(BPF) {
+    for frame in data[got * BPF..len * BPF].as_chunks_mut::<BPF>().0 {
         frame.copy_from_slice(&held);
     }
     fade(data, len, false);

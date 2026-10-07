@@ -64,7 +64,7 @@ static LUT: LazyLock<Box<[u8]>> = LazyLock::new(|| {
 /// `alpha_at` and whose colour occupies the other three.
 fn unpremultiply_row(row: &mut [u8], alpha_at: usize) {
     let lut = &**LUT;
-    for px in row.chunks_exact_mut(4) {
+    for px in row.as_chunks_mut::<4>().0 {
         let a = px[alpha_at] as usize;
         // Fully transparent and fully opaque pixels are identical in both
         // encodings, and they are most of any graphic.
@@ -247,8 +247,8 @@ mod tests {
                 .try_pull_sample(gst::ClockTime::from_seconds(5))
                 .unwrap_or_else(|| panic!("{format}: no output"));
             let map = sample.buffer().unwrap().map_readable().unwrap();
-            for out in map.chunks_exact(4) {
-                assert_eq!(out, expected, "{format}");
+            for out in map.as_chunks::<4>().0 {
+                assert_eq!(*out, expected, "{format}");
             }
             drop(map);
             pipeline.set_state(gst::State::Null).unwrap();

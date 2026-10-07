@@ -242,7 +242,9 @@ fn tap(h: &Harness, upstream: &str, sync: bool) -> Arc<Mutex<Vec<Seen>>> {
                 };
                 let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
                 let peak = map
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]).abs())
                     .fold(0.0f32, f32::max);
                 seen_cb.lock().unwrap().push(Seen { pts, arrived, peak });
