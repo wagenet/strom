@@ -24,7 +24,6 @@ pub mod transitions;
 pub(crate) mod underlay;
 pub mod unpremultiply;
 pub mod video_adapt;
-pub mod video_frame;
 pub mod video_input_bridge;
 /// vImage-backed video conversion. macOS only: the element wraps Accelerate.
 #[cfg(target_os = "macos")]
