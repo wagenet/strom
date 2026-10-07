@@ -10,7 +10,7 @@ pub mod transforms;
 pub use builder::{
     set_ice_transport_policy, BlockBuildContext, BlockBuildError, BlockBuildResult, BlockBuilder,
     BlockLiveness, BusMessageConnectFn, DynamicWebrtcbinStore, ElementSetupFn, LivenessFailure,
-    PreStopFn, WhepEndpointInfo, WhipEndpointInfo,
+    PreStopFn, StopDrainFn, WhepEndpointInfo, WhipEndpointInfo,
 };
 pub use registry::BlockRegistry;
 
