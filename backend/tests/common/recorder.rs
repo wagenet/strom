@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use strom::blocks::builtin::recorder::RecorderBuilder;
 use strom::blocks::{BlockBuildContext, BlockBuilder, PreStopFn};
+use strom::events::EventBroadcaster;
 use strom_types::PropertyValue;
 
 use gstreamer as gst;
@@ -64,6 +65,13 @@ impl Recorder {
     /// `splitmuxsink` pad, so they must run after the inputs are linked.
     pub fn run_setups(&self) {
         crate::common::block::run_setups(&self.ctx);
+    }
+
+    /// [`Recorder::run_setups`] as part of flow `flow_id`, reporting to `events`.
+    pub fn run_setups_for(&self, flow_id: uuid::Uuid, events: &EventBroadcaster) {
+        for setup in self.ctx.take_element_setups() {
+            setup(flow_id, events.clone());
+        }
     }
 
     /// The hooks the pipeline manager runs before it sets the pipeline to NULL.
