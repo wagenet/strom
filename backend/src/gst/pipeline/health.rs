@@ -364,7 +364,8 @@ impl super::PipelineManager {
                     continue;
                 }
 
-                let mut snapshot = scan_block_health(&elements, &unformed_links.unformed(), &reporters);
+                let mut snapshot =
+                    scan_block_health(&elements, &unformed_links.unformed(), &reporters);
 
                 // A block is only reported once it has looked stalled on
                 // CONFIRMATIONS_BEFORE_FAILED scans in a row. Downgrade the

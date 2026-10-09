@@ -1623,8 +1623,10 @@ fn capture(m: &Assembled, tee: &str, sync: bool) -> Envelope {
             for (frame, samples) in map.chunks_exact(4 * channels).enumerate() {
                 let t = pts.nseconds() + frame as u64 * 1_000_000_000 / rate;
                 let peak = samples
-                    .chunks_exact(4)
-                    .map(|b| f32::from_le_bytes(b.try_into().unwrap()).abs())
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| f32::from_le_bytes(*b).abs())
                     .fold(0.0f32, f32::max);
                 let slot = env.entry(t / BUCKET_NS).or_insert(0.0);
                 *slot = slot.max(peak);
