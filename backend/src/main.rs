@@ -17,24 +17,6 @@ use strom::{
     state::AppState,
 };
 
-// On a laptop with two GPUs (Intel or AMD integrated plus a discrete card) the
-// driver runs a program on the integrated GPU unless the program asks for the
-// discrete one. These two exports are how a program asks: the NVIDIA and AMD
-// drivers look them up in the executable at process start. Without them
-// GStreamer's OpenGL lands on the integrated GPU while NVENC/NVDEC run on the
-// NVIDIA card, so every GL frame crosses between the two. Machines with one GPU
-// ignore them. They must live in the executable itself, and `build.rs` passes
-// `/EXPORT:` for each, since a Rust binary exports nothing on its own.
-#[cfg(windows)]
-#[allow(non_upper_case_globals)]
-#[no_mangle]
-pub static NvOptimusEnablement: u32 = 1;
-
-#[cfg(windows)]
-#[allow(non_upper_case_globals)]
-#[no_mangle]
-pub static AmdPowerXpressRequestHighPerformance: u32 = 1;
-
 /// Initialize logging with optional file output, configurable log level, and stdout format.
 /// Returns the reload handle and the initial filter string for runtime changes.
 ///
@@ -287,10 +269,6 @@ enum Commands {
         /// Password to hash (if not provided, will read from stdin)
         password: Option<String>,
     },
-    /// Run the CUDA-GL interop probe pipeline and exit (used by Strom itself)
-    #[cfg(not(target_os = "macos"))]
-    #[command(name = strom::gpu::INTEROP_PROBE_SUBCOMMAND, hide = true)]
-    GpuInteropProbe,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -327,14 +305,6 @@ fn main() -> anyhow::Result<()> {
         match command {
             Commands::HashPassword { password } => {
                 return handle_hash_password(password.as_deref());
-            }
-            #[cfg(not(target_os = "macos"))]
-            Commands::GpuInteropProbe => {
-                if let Err(e) = strom::gpu::run_interop_probe() {
-                    eprintln!("{e}");
-                    std::process::exit(1);
-                }
-                return Ok(());
             }
         }
     }
@@ -556,13 +526,14 @@ fn run_with_gui(
         gstisobmff::plugin_register_static().expect("Could not register isobmff plugins");
         gst_plugins_lsp::plugin_register_static().expect("Could not register lsp-dsp-rs plugins");
         strom::gst::audio_bridge::register().expect("Could not register audio bridge elements");
+        #[cfg(feature = "voice-isolation")]
+        strom::gst::voice_isolation::register()
+            .expect("Could not register the voice isolation element");
         #[cfg(feature = "efp")]
         gst_plugin_efp::plugin_register_static().expect("Could not register efp mux/demux plugins");
 
         // Detect GPU capabilities for video conversion mode selection
         // This tests CUDA-GL interop to determine if autovideoconvert works
-        #[cfg(not(target_os = "macos"))]
-        strom::gpu::run_interop_probe_in_this_executable();
         strom::gpu::detect_gpu_capabilities();
 
         // Report WebRTC ICE availability. WHIP/WHEP blocks refuse to build
@@ -739,66 +710,48 @@ fn run_headless_entry(
 ) -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
     {
-        // `gst_macos_main` does not run this closure on the process main
-        // thread -- it takes that thread for the CFRunLoop and calls us on a
-        // thread it creates itself, which gets the raw pthread default stack
-        // (512 KB on macOS) rather than the main thread's 8 MB.
         gstreamer::macos_main(move || {
-            run_headless_on_own_thread(
-                config,
-                no_auto_restart,
-                log_reload_handle,
-                default_log_filter,
-            )
+            // `gst_macos_main` does not run this closure on the process main
+            // thread -- it takes that thread for the CFRunLoop and calls us on a
+            // thread it creates itself, which gets the raw pthread default stack
+            // (512 KB on macOS) rather than the main thread's 8 MB.
+            // `create_app_with_config` builds the OpenAPI spec, and utoipa's
+            // generated `openapi_spec()` is one deeply nested expression covering
+            // every `StromEvent` variant; it overflows that stack and kills the
+            // process with exit 132 and no panic message, before the HTTP server
+            // ever binds.
+            //
+            // Spawning a Rust thread is what fixes it, not the size below:
+            // `std::thread` defaults to a 2 MiB stack, and that is already
+            // enough today (measured -- it starts and binds normally without an
+            // explicit size). The 8 MB is headroom for the spec continuing to
+            // grow, so keep it, but do not remove the indirection: calling
+            // `run_headless` directly here dies with exit 132.
+            std::thread::Builder::new()
+                .name("strom-headless".into())
+                .stack_size(8 * 1024 * 1024)
+                .spawn(move || {
+                    run_headless(
+                        config,
+                        no_auto_restart,
+                        log_reload_handle,
+                        default_log_filter,
+                    )
+                })
+                .expect("failed to spawn headless thread")
+                .join()
+                .expect("headless thread panicked")
         })
     }
     #[cfg(not(target_os = "macos"))]
     {
-        // Windows gives the main thread a 1 MB stack, which a debug build
-        // overflows the same way.
-        run_headless_on_own_thread(
+        run_headless(
             config,
             no_auto_restart,
             log_reload_handle,
             default_log_filter,
         )
     }
-}
-
-/// Run [`run_headless`] on a thread with a known, large stack.
-///
-/// `create_app_with_config` builds the OpenAPI spec, and utoipa's generated
-/// `openapi_spec()` is one deeply nested expression covering every
-/// `StromEvent` variant. On a small stack it overflows and kills the process
-/// before the HTTP server ever binds: on macOS (the `gst_macos_main` thread,
-/// 512 KB) with exit 132 and no panic message, and on Windows (main thread,
-/// 1 MB) in a debug build with "thread 'main' has overflowed its stack".
-///
-/// Spawning a Rust thread is what fixes it, not the size below:
-/// `std::thread` defaults to a 2 MiB stack, and that is already enough today
-/// (measured on macOS -- it starts and binds normally without an explicit
-/// size). The 8 MB is headroom for the spec continuing to grow, so keep it,
-/// but do not remove the indirection.
-fn run_headless_on_own_thread(
-    config: Config,
-    no_auto_restart: bool,
-    log_reload_handle: strom::state::LogReloadHandle,
-    default_log_filter: String,
-) -> anyhow::Result<()> {
-    std::thread::Builder::new()
-        .name("strom-headless".into())
-        .stack_size(8 * 1024 * 1024)
-        .spawn(move || {
-            run_headless(
-                config,
-                no_auto_restart,
-                log_reload_handle,
-                default_log_filter,
-            )
-        })
-        .expect("failed to spawn headless thread")
-        .join()
-        .expect("headless thread panicked")
 }
 
 /// The DevTools proxy's view of the configuration.
@@ -836,13 +789,14 @@ async fn run_headless(
     gstisobmff::plugin_register_static().expect("Could not register isobmff plugins");
     gst_plugins_lsp::plugin_register_static().expect("Could not register lsp-dsp-rs plugins");
     strom::gst::audio_bridge::register().expect("Could not register audio bridge elements");
+    #[cfg(feature = "voice-isolation")]
+    strom::gst::voice_isolation::register()
+        .expect("Could not register the voice isolation element");
     #[cfg(feature = "efp")]
     gst_plugin_efp::plugin_register_static().expect("Could not register efp mux/demux plugins");
 
     // Detect GPU capabilities for video conversion mode selection
     // This tests CUDA-GL interop to determine if autovideoconvert works
-    #[cfg(not(target_os = "macos"))]
-    strom::gpu::run_interop_probe_in_this_executable();
     strom::gpu::detect_gpu_capabilities();
 
     // Report WebRTC ICE availability. WHIP/WHEP blocks refuse to build

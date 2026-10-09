@@ -13,6 +13,8 @@ use strom_types::PropertyValue;
 fn init_gst() {
     let _ = gst::init();
     let _ = gst_plugins_lsp::plugin_register_static();
+    #[cfg(feature = "voice-isolation")]
+    let _ = crate::gst::voice_isolation::register();
 }
 
 /// GObject type name. `factory()` can SIGSEGV when static and LV2 plugins
@@ -21,7 +23,7 @@ fn type_name(element: &gst::Element) -> &'static str {
     element.type_().name()
 }
 
-fn props(pairs: &[(&str, PropertyValue)]) -> HashMap<String, PropertyValue> {
+pub(super) fn props(pairs: &[(&str, PropertyValue)]) -> HashMap<String, PropertyValue> {
     pairs
         .iter()
         .map(|(k, v)| (k.to_string(), v.clone()))
@@ -507,7 +509,7 @@ const INSTANCE: &str = "mx";
 
 /// Two channels, one aux, one group: small enough to read, and it exercises
 /// every kind of bus the builder wires.
-fn small_mixer_props(extra: &[(&str, PropertyValue)]) -> HashMap<String, PropertyValue> {
+pub(super) fn small_mixer_props(extra: &[(&str, PropertyValue)]) -> HashMap<String, PropertyValue> {
     let mut p = props(&[
         ("num_channels", PropertyValue::UInt(2)),
         ("num_aux_buses", PropertyValue::UInt(1)),
@@ -518,14 +520,14 @@ fn small_mixer_props(extra: &[(&str, PropertyValue)]) -> HashMap<String, Propert
     p
 }
 
-struct Assembled {
+pub(super) struct Assembled {
     instance: &'static str,
-    pipeline: gst::Pipeline,
+    pub(super) pipeline: gst::Pipeline,
     result: BlockBuildResult,
 }
 
 impl Assembled {
-    fn element(&self, id: &str) -> &gst::Element {
+    pub(super) fn element(&self, id: &str) -> &gst::Element {
         let full = format!("{}:{id}", self.instance);
         self.result
             .elements
@@ -535,7 +537,7 @@ impl Assembled {
             .unwrap_or_else(|| panic!("builder produced no element {full}"))
     }
 
-    fn has_element(&self, id: &str) -> bool {
+    pub(super) fn has_element(&self, id: &str) -> bool {
         let full = format!("{}:{id}", self.instance);
         self.result.elements.iter().any(|(k, _)| *k == full)
     }
@@ -576,7 +578,7 @@ fn resolve_pad(element: &gst::Element, name: &str) -> gst::Pad {
 
 /// Build through the real builder and link the result the way the pipeline
 /// manager does: named pads pad-to-pad, element refs by `Element::link`.
-fn assemble(properties: &HashMap<String, PropertyValue>) -> Assembled {
+pub(super) fn assemble(properties: &HashMap<String, PropertyValue>) -> Assembled {
     assemble_as(INSTANCE, properties)
 }
 
@@ -1048,7 +1050,7 @@ fn test_sample_rate_property_parsing() {
 }
 
 /// Link an `audiotestsrc` into `channel`.
-fn feed(m: &Assembled, channel: usize, live: bool) {
+pub(super) fn feed(m: &Assembled, channel: usize, live: bool) {
     let src = gst::ElementFactory::make("audiotestsrc")
         .property("is-live", live)
         .build()
@@ -1621,10 +1623,8 @@ fn capture(m: &Assembled, tee: &str, sync: bool) -> Envelope {
             for (frame, samples) in map.chunks_exact(4 * channels).enumerate() {
                 let t = pts.nseconds() + frame as u64 * 1_000_000_000 / rate;
                 let peak = samples
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|b| f32::from_le_bytes(*b).abs())
+                    .chunks_exact(4)
+                    .map(|b| f32::from_le_bytes(b.try_into().unwrap()).abs())
                     .fold(0.0f32, f32::max);
                 let slot = env.entry(t / BUCKET_NS).or_insert(0.0);
                 *slot = slot.max(peak);

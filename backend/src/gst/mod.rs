@@ -30,6 +30,8 @@ pub mod video_memory_front;
 /// vImage-backed video conversion. macOS only: the element wraps Accelerate.
 #[cfg(target_os = "macos")]
 pub mod vimage;
+#[cfg(feature = "voice-isolation")]
+pub mod voice_isolation;
 pub mod volume_ramp;
 pub mod whep_probe;
 
