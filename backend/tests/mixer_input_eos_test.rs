@@ -45,6 +45,10 @@ const REQUIRED_ELEMENTS: &[&str] = &[
 
 fn require_elements() {
     gst::init().unwrap();
+    // The mixer puts voice isolation on every channel, and its element is
+    // registered by the binary, not by the plugin scan.
+    #[cfg(feature = "voice-isolation")]
+    let _ = strom::gst::voice_isolation::register();
     let missing: Vec<&str> = REQUIRED_ELEMENTS
         .iter()
         .copied()
