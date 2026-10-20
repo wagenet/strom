@@ -556,6 +556,9 @@ fn run_with_gui(
         gstisobmff::plugin_register_static().expect("Could not register isobmff plugins");
         gst_plugins_lsp::plugin_register_static().expect("Could not register lsp-dsp-rs plugins");
         strom::gst::audio_bridge::register().expect("Could not register audio bridge elements");
+        #[cfg(feature = "voice-isolation")]
+        strom::gst::voice_isolation::register()
+            .expect("Could not register the voice isolation element");
         #[cfg(feature = "efp")]
         gst_plugin_efp::plugin_register_static().expect("Could not register efp mux/demux plugins");
 
@@ -836,6 +839,9 @@ async fn run_headless(
     gstisobmff::plugin_register_static().expect("Could not register isobmff plugins");
     gst_plugins_lsp::plugin_register_static().expect("Could not register lsp-dsp-rs plugins");
     strom::gst::audio_bridge::register().expect("Could not register audio bridge elements");
+    #[cfg(feature = "voice-isolation")]
+    strom::gst::voice_isolation::register()
+        .expect("Could not register the voice isolation element");
     #[cfg(feature = "efp")]
     gst_plugin_efp::plugin_register_static().expect("Could not register efp mux/demux plugins");
 
