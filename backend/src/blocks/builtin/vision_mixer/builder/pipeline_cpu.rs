@@ -9,7 +9,9 @@ use tracing::info;
 use super::super::{elements, layout};
 use super::{audio_meter, pad_layout, setup_overlay_renderer, PipelineParams};
 use crate::blocks::{BlockBuildContext, BlockBuildError, BlockBuildResult};
+use crate::gpu;
 use crate::gst::download_front;
+use crate::gst::unpremultiply;
 use crate::gst::video_adapt::VIDEO_CONVERT_FACTORY;
 
 pub(super) fn build_cpu_pipeline(
@@ -166,7 +168,43 @@ pub(super) fn build_cpu_pipeline(
             ElementPadRef::pad(&q_id, "src"),
             ElementPadRef::pad(&front_id, "sink"),
         ));
-        links.push(front_link);
+        if p.dsk_premultiplied(i) {
+            // `compositor` blends straight alpha only, so a premultiplied
+            // source is unpremultiplied first. The element takes packed RGB
+            // with alpha; the converter in front brings other formats (such as
+            // a decoded A420 clip) to that, and passes RGBA-family input
+            // straight through.
+            if !unpremultiply::register() {
+                return Err(BlockBuildError::ElementCreation(format!(
+                    "DSK{} is premultiplied but {} could not be registered",
+                    i + 1,
+                    unpremultiply::ELEMENT_NAME
+                )));
+            }
+            let vc_pre_id = p.id(&format!("videoconvert_unpremultiply_dsk_{}", i));
+            let unpre_id = p.id(&format!("unpremultiply_dsk_{}", i));
+            let videoconvert_pre = elements::make_element(VIDEO_CONVERT_FACTORY, &vc_pre_id)?;
+            gpu::configure_video_convert(&videoconvert_pre);
+            elems.push((vc_pre_id.clone(), videoconvert_pre));
+            elems.push((
+                unpre_id.clone(),
+                elements::make_element(unpremultiply::ELEMENT_NAME, &unpre_id)?,
+            ));
+            links.push((
+                ElementPadRef::pad(&front_id, "src"),
+                ElementPadRef::pad(&vc_pre_id, "sink"),
+            ));
+            links.push((
+                ElementPadRef::pad(&vc_pre_id, "src"),
+                ElementPadRef::pad(&unpre_id, "sink"),
+            ));
+            links.push((
+                ElementPadRef::pad(&unpre_id, "src"),
+                ElementPadRef::pad(&vc_id_dsk, "sink"),
+            ));
+        } else {
+            links.push(front_link);
+        }
 
         // No output_format capsfilter here. A DSK is a keyer: forcing an
         // alpha-less format (I420/NV12) ahead of the compositor silently
