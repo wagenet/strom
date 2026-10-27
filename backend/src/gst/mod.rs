@@ -1,6 +1,7 @@
 //! GStreamer integration.
 
 pub(crate) mod aggregator_start;
+pub mod audio_bridge;
 mod block_expansion;
 pub mod buffer_age_probe;
 pub mod context_forward;
@@ -56,6 +57,7 @@ pub fn register_static_plugins() {
         );
     }
     gst_plugins_lsp::plugin_register_static().expect("Could not register lsp-dsp-rs plugins");
+    audio_bridge::register().expect("Could not register audio bridge elements");
     #[cfg(feature = "efp")]
     gst_plugin_efp::plugin_register_static().expect("Could not register efp mux/demux plugins");
 }
