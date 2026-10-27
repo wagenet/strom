@@ -30,6 +30,8 @@ pub(crate) mod underlay;
 pub mod unpremultiply;
 pub mod video_adapt;
 pub mod video_input_bridge;
+#[cfg(feature = "voice-isolation")]
+pub mod voice_isolation;
 pub mod volume_ramp;
 pub mod whep_probe;
 
@@ -58,6 +60,8 @@ pub fn register_static_plugins() {
     }
     gst_plugins_lsp::plugin_register_static().expect("Could not register lsp-dsp-rs plugins");
     audio_bridge::register().expect("Could not register audio bridge elements");
+    #[cfg(feature = "voice-isolation")]
+    voice_isolation::register().expect("Could not register the voice isolation element");
     #[cfg(feature = "efp")]
     gst_plugin_efp::plugin_register_static().expect("Could not register efp mux/demux plugins");
 }
