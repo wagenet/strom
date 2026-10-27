@@ -1583,6 +1583,7 @@ impl PropertyInspector {
                 "num_channels"
                     | "num_aux_buses"
                     | "num_groups"
+                    | "direct_outs"
                     | "dsp_backend"
                     | "force_live"
                     | "latency"
