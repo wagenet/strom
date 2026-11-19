@@ -247,6 +247,12 @@ path = "tests/mpegtssrt_multi_video_test.rs"
 name = "qos_probe_criticals_test"
 path = "tests/qos_probe_criticals_test.rs"
 
+# CEF initialises once per process and starts Chromium, and these tests run
+# serially against it. It also needs GST_PLUGIN_PATH and the CEF environment.
+[[test]]
+name = "stinger_web_test"
+path = "tests/stinger_web_test.rs"
+
 # Registers a decoder that refuses, ranked above the real decoders.
 [[test]]
 name = "stinger_software_decode_test"

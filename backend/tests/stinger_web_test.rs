@@ -45,28 +45,6 @@ fn takes() -> usize {
         .unwrap_or(10)
 }
 
-fn cefsrc_available() -> bool {
-    gst::init().unwrap();
-    let required = strom_types::env::var_opt("STROM_REQUIRE_CEF").is_some();
-    if !cfg!(target_os = "linux") {
-        assert!(
-            !required,
-            "STROM_REQUIRE_CEF is set, but these tests run on Linux only"
-        );
-        eprintln!("SKIP: cefsrc tests run on Linux only");
-        return false;
-    }
-    if gst::ElementFactory::find("cefsrc").is_some() {
-        return true;
-    }
-    assert!(
-        !required,
-        "STROM_REQUIRE_CEF is set but the cefsrc element is not installed (check GST_PLUGIN_PATH)"
-    );
-    eprintln!("SKIP: cefsrc not installed (set STROM_REQUIRE_CEF=1 to fail instead)");
-    false
-}
-
 fn data_url(html: &str) -> String {
     format!(
         "data:text/html;base64,{}",
@@ -447,7 +425,7 @@ async fn cuts_on_the_frame_its_cut_point_names(backend: &str, page_fps: u64) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn cpu_page_stinger_cuts_on_the_frame_its_cut_point_names() {
-    if !cefsrc_available() {
+    if !common::cef_available() {
         return;
     }
     cuts_on_the_frame_its_cut_point_names("cpu", 30).await;
@@ -461,7 +439,7 @@ async fn cpu_page_stinger_cuts_on_the_frame_its_cut_point_names() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn cpu_page_stinger_faster_than_the_mixer_cuts_on_the_frame_its_cut_point_names() {
-    if !cefsrc_available() {
+    if !common::cef_available() {
         return;
     }
     cuts_on_the_frame_its_cut_point_names("cpu", 60).await;
@@ -470,7 +448,7 @@ async fn cpu_page_stinger_faster_than_the_mixer_cuts_on_the_frame_its_cut_point_
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn gpu_page_stinger_cuts_on_the_frame_its_cut_point_names() {
-    if !cefsrc_available() || !common::gl_available(rig::GL_ELEMENTS) {
+    if !common::cef_available() || !common::gl_available(rig::GL_ELEMENTS) {
         return;
     }
     cuts_on_the_frame_its_cut_point_names("gpu", 30).await;
@@ -482,7 +460,7 @@ async fn gpu_page_stinger_cuts_on_the_frame_its_cut_point_names() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn a_dropped_take_request_still_frees_the_mixer() {
-    if !cefsrc_available() {
+    if !common::cef_available() {
         return;
     }
     let r = start("web_stinger_dropped", "cpu", &covering_page(), 1000, 30).await;
@@ -520,7 +498,7 @@ async fn a_dropped_take_request_still_frees_the_mixer() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn a_late_painting_page_is_timed_from_the_take() {
-    if !cefsrc_available() {
+    if !common::cef_available() {
         return;
     }
     const TOLERANCE_MS: i64 = 67;

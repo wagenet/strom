@@ -197,7 +197,7 @@ jobs:
         run: |
           gh api --paginate "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
             --jq '.[].filename' > changed-files.txt
-          if grep -E '^(docker/strom-full/|docker/gstcefsrc/|\.github/workflows/build-gstcefsrc\.yml$|backend/tests/cefsrc_test\.rs$)' changed-files.txt; then
+          if grep -E '^(docker/strom-full/|docker/gstcefsrc/|\.github/workflows/build-gstcefsrc\.yml$|backend/tests/(cefsrc|stinger_web)_test\.rs$)' changed-files.txt; then
             echo "touched=true" >> "$GITHUB_OUTPUT"
           else
             echo "touched=false" >> "$GITHUB_OUTPUT"
@@ -291,7 +291,7 @@ jobs:
         run: sh docker/strom-full/install-gstcefsrc.sh "${{ steps.gstcefsrc.outputs.tarball }}"
 
       - name: Build tests
-        run: cargo test --package strom --test cefsrc_test --no-run
+        run: cargo test --package strom --test cefsrc_test --test stinger_web_test --no-run
 
       - name: Run cefsrc tests
         env:
@@ -310,7 +310,7 @@ jobs:
           export GST_CEF_CHROME_EXTRA_FLAGS="$CEF_SOFTWARE_FLAGS"
           cef_setup_cache
           cef_preload_mallinfo_shim
-          cargo test --package strom --test cefsrc_test -- --nocapture 2>&1 | tee cefsrc-test.log
+          cargo test --package strom --test cefsrc_test --test stinger_web_test -- --nocapture 2>&1 | tee cefsrc-test.log
 
       - name: Upload test log
         if: always()
